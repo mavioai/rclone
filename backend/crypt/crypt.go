@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -989,6 +990,11 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 type Object struct {
 	fs.Object
 	f *Fs
+
+	mu sync.Mutex
+	// fileNonce is the nonce of the file's header, once a read found it;
+	// seeks then skip reading the header again
+	fileNonce *nonce
 }
 
 func (f *Fs) newObject(o fs.Object) *Object {
@@ -1065,7 +1071,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.Read
 			openOptions = append(openOptions, option)
 		}
 	}
-	rc, err = o.f.cipher.DecryptDataSeek(ctx, func(ctx context.Context, underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
+	open := func(ctx context.Context, underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
 		if underlyingOffset == 0 && underlyingLimit < 0 {
 			// Open with no seek
 			return o.Object.Open(ctx, openOptions...)
@@ -1080,9 +1086,22 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.Read
 		}
 		newOpenOptions := append(openOptions, &fs.RangeOption{Start: underlyingOffset, End: end})
 		return o.Object.Open(ctx, newOpenOptions...)
-	}, offset, limit)
+	}
+	o.mu.Lock()
+	fileNonce := o.fileNonce
+	o.mu.Unlock()
+	if fileNonce != nil && offset > 0 {
+		return o.f.cipher.newDecrypterSeekNonce(ctx, open, *fileNonce, offset, limit)
+	}
+	rc, err = o.f.cipher.DecryptDataSeek(ctx, open, offset, limit)
 	if err != nil {
 		return nil, err
+	}
+	if fh, ok := rc.(*decrypter); ok {
+		n := fh.initialNonce
+		o.mu.Lock()
+		o.fileNonce = &n
+		o.mu.Unlock()
 	}
 	return rc, nil
 }

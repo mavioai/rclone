@@ -894,6 +894,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Arm progress so the very first 429 is logged at NOTICE.
 	f.throttle.progress.Store(true)
 	f.features = (&fs.Features{
+		FindByListing:           true, // NewObject lists the parent folder
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
 

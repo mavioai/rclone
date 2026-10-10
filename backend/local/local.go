@@ -1110,6 +1110,40 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return dstObj, nil
 }
 
+// Link hard links src to remote, both then sharing the file's data.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible, as across file systems, then return
+// fs.ErrorCantLink
+func (f *Fs) Link(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't hard link - not same remote type")
+		return nil, fs.ErrorCantLink
+	}
+	dstObj, err := f.newObject(remote)
+	if err != nil {
+		return nil, err
+	}
+	if err := dstObj.mkdirAll(); err != nil {
+		return nil, err
+	}
+	err = os.Link(srcObj.path, dstObj.path)
+	switch {
+	case os.IsExist(err), os.IsNotExist(err), os.IsPermission(err):
+		return nil, err
+	case err != nil:
+		// Probably across file systems, or a file system without links.
+		fs.Debugf(src, "Can't hard link: %v", err)
+		return nil, fs.ErrorCantLink
+	}
+	if err := dstObj.lstat(); err != nil {
+		return nil, err
+	}
+	return dstObj, nil
+}
+
 // DirMove moves src, srcRemote to this remote at dstRemote
 // using server-side move operations.
 //
@@ -2003,6 +2037,7 @@ var (
 	_ fs.Fs              = &Fs{}
 	_ fs.PutStreamer     = &Fs{}
 	_ fs.Mover           = &Fs{}
+	_ fs.Linker          = &Fs{}
 	_ fs.DirMover        = &Fs{}
 	_ fs.Commander       = &Fs{}
 	_ fs.OpenWriterAter  = &Fs{}

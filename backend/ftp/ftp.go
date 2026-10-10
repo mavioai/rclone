@@ -727,6 +727,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (ff fs.Fs
 	if !f.fLstTime && f.fGetTime {
 		f.features.SlowModTime = true
 	}
+	// Without MLST, NewObject lists the parent directory
+	f.features.FindByListing = !f.fLstTime
 	f.putFtpConnection(&c, nil)
 	if root != "" {
 		// Check to see if the root actually an existing file

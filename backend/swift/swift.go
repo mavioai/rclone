@@ -1473,6 +1473,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	fs.FixRangeOption(options, o.size)
 	headers := fs.OpenOptionHeaders(options)
 	_, isRanging := headers["Range"]
+	if etag := o.ifMatch(); etag != "" {
+		// Read the version found, so that an object replaced since
+		// fails with 412 Precondition Failed instead of returning
+		// mixed content.
+		if headers == nil {
+			headers = swift.Headers{}
+		}
+		headers["If-Match"] = `"` + etag + `"`
+	}
 	container, containerPath := o.split()
 	err = o.fs.pacer.Call(func() (bool, error) {
 		var rxHeaders swift.Headers
@@ -1480,6 +1489,34 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return shouldRetryHeaders(ctx, rxHeaders, err)
 	})
 	return
+}
+
+// VersionTag returns the ETag the object was found with, or ""
+func (o *Object) VersionTag() string {
+	return o.ifMatch()
+}
+
+// ifMatch returns the ETag to make reads of the object conditional on,
+// or "" if it isn't known.
+//
+// The ETag of a large object isn't the hash a listing gives, so an
+// object that may be one gives "" unless a HEAD showed it isn't.
+func (o *Object) ifMatch() string {
+	if o.md5 == "" {
+		return ""
+	}
+	if !o.fs.opt.NoLargeObjects {
+		if o.headers == nil {
+			return ""
+		}
+		if _, ok := o.headers["X-Object-Manifest"]; ok {
+			return ""
+		}
+		if _, ok := o.headers["X-Static-Large-Object"]; ok {
+			return ""
+		}
+	}
+	return o.md5
 }
 
 // Get the segments for a large object
@@ -1713,12 +1750,13 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = &Fs{}
-	_ fs.Purger      = &Fs{}
-	_ fs.PutStreamer = &Fs{}
-	_ fs.Copier      = &Fs{}
-	_ fs.ListRer     = &Fs{}
-	_ fs.ListPer     = &Fs{}
-	_ fs.Object      = &Object{}
-	_ fs.MimeTyper   = &Object{}
+	_ fs.Fs            = &Fs{}
+	_ fs.Purger        = &Fs{}
+	_ fs.PutStreamer   = &Fs{}
+	_ fs.Copier        = &Fs{}
+	_ fs.ListRer       = &Fs{}
+	_ fs.ListPer       = &Fs{}
+	_ fs.Object        = &Object{}
+	_ fs.MimeTyper     = &Object{}
+	_ fs.VersionTagger = &Object{}
 )

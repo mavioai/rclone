@@ -15,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/fs/objcache"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/lib/diskusage"
 )
@@ -178,6 +179,38 @@ func init() {
 	}
 }
 
+func init() {
+	rc.Add(rc.Call{
+		Path:  "operations/hardlink",
+		Fn:    rcHardlink,
+		Title: "Hard link a file to another path of the same remote",
+		Help: `This takes the following parameters:
+
+- srcFs - a remote name string e.g. "nas:" for the source, "/" for local filesystem
+- srcRemote - a path within that remote e.g. "downloads/file.mkv" for the source
+- dstFs - a remote name string of the same remote e.g. "nas:"
+- dstRemote - a path within that remote e.g. "movies/file.mkv" for the link
+
+Both names then share the file's data. It fails with "can't hard link
+object" when the remote cannot link the file, such as across volumes or
+for remotes without the Link feature, and when dstRemote exists.
+`,
+	})
+}
+
+func rcHardlink(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	srcFs, srcRemote, err := rc.GetFsAndRemoteNamed(ctx, in, "srcFs", "srcRemote")
+	if err != nil {
+		return nil, err
+	}
+	dstFs, dstRemote, err := rc.GetFsAndRemoteNamed(ctx, in, "dstFs", "dstRemote")
+	if err != nil {
+		return nil, err
+	}
+	defer objcache.Default.Drop(dstFs, dstRemote)
+	return nil, Link(ctx, dstFs, srcFs, dstRemote, srcRemote)
+}
+
 // Copy a file
 func rcMoveOrCopyFile(ctx context.Context, in rc.Params, cp bool) (out rc.Params, err error) {
 	srcFs, srcRemote, err := rc.GetFsAndRemoteNamed(ctx, in, "srcFs", "srcRemote")
@@ -187,6 +220,10 @@ func rcMoveOrCopyFile(ctx context.Context, in rc.Params, cp bool) (out rc.Params
 	dstFs, dstRemote, err := rc.GetFsAndRemoteNamed(ctx, in, "dstFs", "dstRemote")
 	if err != nil {
 		return nil, err
+	}
+	defer objcache.Default.Drop(dstFs, dstRemote)
+	if !cp {
+		defer objcache.Default.Drop(srcFs, srcRemote)
 	}
 	return nil, moveOrCopyFile(ctx, dstFs, srcFs, dstRemote, srcRemote, cp, false)
 }
@@ -248,6 +285,8 @@ func rcSingleCommand(ctx context.Context, in rc.Params, name string, noRemote bo
 	if err != nil {
 		return nil, err
 	}
+	// Drop the cached objects the command may change once it ends
+	defer objcache.Default.Drop(f, remote)
 	switch name {
 	case "mkdir":
 		return nil, Mkdir(ctx, f, remote)
@@ -419,6 +458,107 @@ func rcPublicLink(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	out = make(rc.Params)
 	out["url"] = url
 	return out, nil
+}
+
+func init() {
+	rc.Add(rc.Call{
+		Path:  "operations/addurl",
+		Fn:    rcAddURL,
+		Title: "Submit a remote URL to be downloaded server-side.",
+		Help: `This takes the following parameters:
+
+- fs - a remote name string e.g. "cloud115:downloads"
+- url - URL or magnet link to download
+- name - optional custom filename
+- opt - optional map of string options
+
+Returns:
+
+- task - created OfflineTask object
+`,
+	})
+	rc.Add(rc.Call{
+		Path:  "operations/listoffline",
+		Fn:    rcListOffline,
+		Title: "List server-side offline download tasks.",
+		Help: `This takes the following parameters:
+
+- fs - a remote name string e.g. "cloud115:"
+
+Returns:
+
+- tasks - array of OfflineTask objects
+`,
+	})
+	rc.Add(rc.Call{
+		Path:  "operations/deleteoffline",
+		Fn:    rcDeleteOffline,
+		Title: "Delete a server-side offline download task.",
+		Help: `This takes the following parameters:
+
+- fs - a remote name string e.g. "cloud115:"
+- task_id - ID/hash of the task to delete
+`,
+	})
+}
+
+func rcAddURL(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	f, err := rc.GetFs(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	url, err := in.GetString("url")
+	if err != nil {
+		return nil, err
+	}
+	opt := make(map[string]string)
+	if name, err := in.GetString("name"); err == nil && name != "" {
+		opt["name"] = name
+	}
+	if optMap, ok := in["opt"].(map[string]any); ok {
+		for k, v := range optMap {
+			opt[k] = fmt.Sprint(v)
+		}
+	}
+	task, err := AddURL(ctx, f, url, opt)
+	if err != nil {
+		return nil, err
+	}
+	return rc.Params{
+		"task": task,
+	}, nil
+}
+
+func rcListOffline(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	f, err := rc.GetFs(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := ListOfflineTasks(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	return rc.Params{
+		"tasks": tasks,
+	}, nil
+}
+
+func rcDeleteOffline(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	f, err := rc.GetFs(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	taskID, err := in.GetString("task_id")
+	if err != nil {
+		return nil, err
+	}
+	err = DeleteOfflineTask(ctx, f, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return rc.Params{
+		"status": "success",
+	}, nil
 }
 
 func init() {
@@ -630,6 +770,8 @@ func rcBackend(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// A command may change any object of the remote
+	defer objcache.Default.Drop(f, "")
 	result, err := doCommand(ctx, command, arg, opt)
 	if err != nil {
 		return nil, fmt.Errorf("command %q failed: %w", command, err)

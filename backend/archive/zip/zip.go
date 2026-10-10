@@ -89,6 +89,7 @@ func New(ctx context.Context, wrappedFs fs.Fs, remote, prefix, root string) (fs.
 		WriteMimeType:           false,
 		BucketBased:             false,
 		CanHaveEmptyDirectories: true,
+		SeekReadsFromStart:      true, // compressed members are read from their start
 	}).Fill(ctx, f).Mask(ctx, wrappedFs).WrapsFs(f, wrappedFs)
 
 	if singleObject {

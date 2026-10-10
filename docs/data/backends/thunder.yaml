@@ -1,0 +1,27 @@
+backend: thunder
+name: Xunlei Drive
+tier: Tier 4
+maintainers: External
+features_score: 5
+integration_tests: Untested
+data_integrity: Hash
+performance: High
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'TestThunder:'
+features:
+- AddURL
+- CanHaveEmptyDirectories
+- Command
+- Copy
+- DeleteOfflineTask
+- DirCacheFlush
+- DirMove
+- ListOfflineTasks
+- Move
+- Purge
+hashes:
+- gcid
+precision: 3153600000000000000

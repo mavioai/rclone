@@ -11,8 +11,10 @@ import (
 	"github.com/rclone/rclone/backend/crypt"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/filter"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/objcache"
 	"github.com/rclone/rclone/fs/walk"
 )
 
@@ -246,7 +248,10 @@ func ListJSON(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOpt, 
 	if err != nil {
 		return err
 	}
+	// A listing of one folder without filters holds everything in it
+	complete := !lj.opt.Recurse && filter.GetConfig(ctx).InActive()
 	err = walk.ListR(ctx, fsrc, remote, false, ConfigMaxDepth(ctx, lj.opt.Recurse), walk.ListAll, func(entries fs.DirEntries) (err error) {
+		objcache.Default.Refresh(fsrc, remote, entries, complete)
 		for _, entry := range entries {
 			item, err := lj.entry(ctx, entry)
 			if err != nil {
@@ -306,6 +311,11 @@ func StatJSON(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOpt) 
 		// NewObject can return the sentinel errors ErrorObjectNotFound or ErrorIsDir
 		// ErrorObjectNotFound can mean the source is a directory or not found
 		obj, err := fsrc.NewObject(ctx, remote)
+		if err == nil {
+			objcache.Default.Put(fsrc, obj)
+		} else {
+			objcache.Default.Remove(fsrc, remote)
+		}
 		if err == fs.ErrorObjectNotFound {
 			if !lj.dirs {
 				return nil, nil

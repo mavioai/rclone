@@ -28,12 +28,16 @@ rclone config
 
 See the following for detailed instructions for
 
+- [115 Cloud](/cloud115/)
+- [123 Cloud](/cloud123/)
 - [1Fichier](/fichier/)
 - [Akamai Netstorage](/netstorage/)
 - [Alias](/alias/)
+- [Aliyun Drive](/aliyundrive/)
 - [Archive](/archive/)
 - [Amazon S3](/s3/)
 - [Backblaze B2](/b2/)
+- [Baidu Netdisk](/baidunetdisk/)
 - [Box](/box/)
 - [Chunker](/chunker/) - transparently splits large files for other remotes
 - [Citrix ShareFile](/sharefile/)
@@ -54,6 +58,7 @@ See the following for detailed instructions for
 - [Google Cloud Storage](/googlecloudstorage/)
 - [Google Drive](/drive/)
 - [Google Photos](/googlephotos/)
+- [GuangYa Drive](/guangyadrive/)
 - [Hasher](/hasher/) - to handle checksums for other remotes
 - [HDFS](/hdfs/)
 - [Hetzner Storage Box](/sftp/#hetzner-storage-box)
@@ -82,6 +87,7 @@ See the following for detailed instructions for
 - [put.io](/putio/)
 - [Proton Drive](/protondrive/)
 - [QingStor](/qingstor/)
+- [Quark Drive / UC Drive](/quark/)
 - [Quatrix by Maytech](/quatrix/)
 - [rsync.net](/sftp/#rsync-net)
 - [Seafile](/seafile/)
@@ -91,9 +97,11 @@ See the following for detailed instructions for
 - [SMB](/smb/)
 - [Storj](/storj/)
 - [SugarSync](/sugarsync/)
+- [Tencent Weiyun](/weiyun/)
 - [Union](/union/)
 - [Uloz.to](/ulozto/)
 - [WebDAV](/webdav/)
+- [Xunlei Drive](/thunder/)
 - [Yandex Disk](/yandex/)
 - [Zoho WorkDrive](/zoho/)
 - [The local filesystem](/local/)

@@ -1018,7 +1018,10 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 		XQSCopySource: &sourceKey,
 		ContentType:   &mimeType,
 	}
-	_, err = bucketInit.PutObject(bucketPath, &req)
+	resp, err := bucketInit.PutObject(bucketPath, &req)
+	if err == nil && resp.ETag != nil {
+		o.etag = qs.StringValue(resp.ETag) // the copy may have a new ETag
+	}
 
 	return err
 }
@@ -1032,6 +1035,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	req := qs.GetObjectInput{}
+	if o.etag != "" {
+		// Read the version found, so that an object replaced since
+		// fails with 412 Precondition Failed instead of returning
+		// mixed content.
+		req.IfMatch = qs.String(o.etag)
+	}
 	fs.FixRangeOption(options, o.size)
 	for _, option := range options {
 		switch option.(type) {
@@ -1101,6 +1110,11 @@ func (o *Object) Remove(ctx context.Context) error {
 	return err
 }
 
+// VersionTag returns the ETag the object was found with, or ""
+func (o *Object) VersionTag() string {
+	return o.etag
+}
+
 // Fs returns read only access to the Fs that this object is part of
 func (o *Object) Fs() fs.Info {
 	return o.fs
@@ -1158,10 +1172,11 @@ func (o *Object) MimeType(ctx context.Context) string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs         = &Fs{}
-	_ fs.CleanUpper = &Fs{}
-	_ fs.Copier     = &Fs{}
-	_ fs.Object     = &Object{}
-	_ fs.ListRer    = &Fs{}
-	_ fs.MimeTyper  = &Object{}
+	_ fs.Fs            = &Fs{}
+	_ fs.CleanUpper    = &Fs{}
+	_ fs.Copier        = &Fs{}
+	_ fs.Object        = &Object{}
+	_ fs.VersionTagger = &Object{}
+	_ fs.ListRer       = &Fs{}
+	_ fs.MimeTyper     = &Object{}
 )

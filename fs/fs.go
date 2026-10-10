@@ -28,6 +28,7 @@ var (
 	ErrorCantPurge                   = errors.New("can't purge directory")
 	ErrorCantCopy                    = errors.New("can't copy object - incompatible remotes")
 	ErrorCantMove                    = errors.New("can't move object - incompatible remotes")
+	ErrorCantLink                    = errors.New("can't hard link object - incompatible remotes or volumes")
 	ErrorCantDirMove                 = errors.New("can't move directory - incompatible remotes")
 	ErrorCantUploadEmptyFiles        = errors.New("can't upload empty files to this remote")
 	ErrorDirExists                   = errors.New("can't copy directory - destination already exists")

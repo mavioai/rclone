@@ -23,6 +23,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 	"golang.org/x/net/html"
 )
@@ -188,9 +189,20 @@ func statusError(res *http.Response, err error) error {
 	}
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		_ = res.Body.Close()
-		return fmt.Errorf("HTTP Error: %s", res.Status)
+		return &StatusError{Status: res.Status, StatusCode: res.StatusCode}
 	}
 	return nil
+}
+
+// StatusError is an HTTP response with a status other than 2xx
+type StatusError struct {
+	Status     string
+	StatusCode int
+}
+
+// Error implements error
+func (e *StatusError) Error() string {
+	return "HTTP Error: " + e.Status
 }
 
 // getFsEndpoint decides if url is to be considered a file or directory,
@@ -819,6 +831,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	if err = o.decodeMetadata(ctx, res); err != nil {
 		return nil, fmt.Errorf("decodeMetadata failed: %w", err)
+	}
+	if res.StatusCode == http.StatusOK && readers.RangeRequested(options) {
+		// The server ignored the range and sent the whole file
+		fs.Debugf(o, "Server returned full content instead of range")
+		return readers.SkipToRange(res.Body, o.size, options)
 	}
 	return res.Body, nil
 }

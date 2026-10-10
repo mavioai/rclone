@@ -112,10 +112,14 @@ WebDAV or S3, that work out of the box.)
 <!-- markdownlint-disable line-length no-bare-urls -->
 
 {{< provider_list >}}
+{{< provider name="115 Cloud" home="https://115.com/" config="/cloud115/" >}}
+{{< provider name="123 Cloud" home="https://www.123pan.com/" config="/cloud123/" >}}
 {{< provider name="1Fichier" home="https://1fichier.com/" config="/fichier/" start="true">}}
 {{< provider name="Akamai Netstorage" home="https://www.akamai.com/us/en/products/media-delivery/netstorage.jsp" config="/netstorage/" >}}
 {{< provider name="Alibaba Cloud (Aliyun) Object Storage System (OSS)" home="https://www.alibabacloud.com/product/oss/" config="/s3/#alibaba-oss" >}}
+{{< provider name="Aliyun Drive" home="https://www.alipan.com/" config="/aliyundrive/" >}}
 {{< provider name="Amazon S3" home="https://aws.amazon.com/s3/" config="/s3/" >}}
+{{< provider name="Baidu Netdisk" home="https://pan.baidu.com/" config="/baidunetdisk/" >}}
 {{< provider name="Bizfly Cloud Simple Storage" home="https://bizflycloud.vn/" config="/s3/#bizflycloud" >}}
 {{< provider name="Backblaze B2" home="https://www.backblaze.com/cloud-storage" config="/b2/" >}}
 {{< provider name="Box" home="https://www.box.com/" config="/box/" >}}
@@ -145,6 +149,7 @@ WebDAV or S3, that work out of the box.)
 {{< provider name="Google Cloud Storage" home="https://cloud.google.com/storage/" config="/googlecloudstorage/" >}}
 {{< provider name="Google Drive" home="https://www.google.com/drive/" config="/drive/" >}}
 {{< provider name="Google Photos" home="https://www.google.com/photos/about/" config="/googlephotos/" >}}
+{{< provider name="GuangYa Drive" home="https://www.guangyapan.com/" config="/guangyadrive/" >}}
 {{< provider name="HDFS" home="https://hadoop.apache.org/" config="/hdfs/" >}}
 {{< provider name="Hetzner Object Storage" home="https://www.hetzner.com/storage/object-storage/" config="/s3/#hetzner" >}}
 {{< provider name="Hetzner Storage Box" home="https://www.hetzner.com/storage/storage-box" config="/sftp/#hetzner-storage-box" >}}
@@ -197,6 +202,7 @@ WebDAV or S3, that work out of the box.)
 {{< provider name="Proton Drive" home="https://proton.me/drive" config="/protondrive/" >}}
 {{< provider name="QingStor" home="https://www.qingcloud.com/products/storage" config="/qingstor/" >}}
 {{< provider name="Qiniu Cloud Object Storage (Kodo)" home="https://www.qiniu.com/en/products/kodo" config="/s3/#qiniu" >}}
+{{< provider name="Quark Drive / UC Drive" home="https://pan.quark.cn/" config="/quark/" >}}
 {{< provider name="Quatrix by Maytech" home="https://www.maytech.net/products/quatrix-business" config="/quatrix/" >}}
 {{< provider name="Rabata Cloud Storage" home="https://rabata.io" config="/s3/#Rabata" >}}
 {{< provider name="RackCorp Object Storage" home="https://www.rackcorp.com/" config="/s3/#RackCorp" >}}
@@ -219,10 +225,12 @@ WebDAV or S3, that work out of the box.)
 {{< provider name="Synology" home="https://c2.synology.com/en-global/object-storage/overview" config="/s3/#synology-c2" >}}
 {{< provider name="SugarSync" home="https://sugarsync.com/" config="/sugarsync/" >}}
 {{< provider name="Tencent Cloud Object Storage (COS)" home="https://intl.cloud.tencent.com/product/cos" config="/s3/#tencent-cos" >}}
+{{< provider name="Tencent Weiyun" home="https://www.weiyun.com/" config="/weiyun/" >}}
 {{< provider name="Uloz.to" home="https://uloz.to" config="/ulozto/" >}}
 {{< provider name="US3" home="https://www.ucloud.cn/site/product/ufile.html" config="/s3/#us3" >}}
 {{< provider name="Wasabi" home="https://wasabi.com/" config="/s3/#wasabi" >}}
 {{< provider name="WebDAV" home="https://en.wikipedia.org/wiki/WebDAV" config="/webdav/" >}}
+{{< provider name="Xunlei Drive" home="https://pan.xunlei.com/" config="/thunder/" >}}
 {{< provider name="Yandex Disk" home="https://disk.yandex.com/" config="/yandex/" >}}
 {{< provider name="Zadara Object Storage" home="https://www.zadara.com" config="/s3/#zadara" >}}
 {{< provider name="Zero Services (ZERO-Z3)" home="https://lp.zeroservices.eu/zero-z3/" config="/s3/#zero-z3" >}}

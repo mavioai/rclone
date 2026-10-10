@@ -327,9 +327,51 @@ rclone backend addurl pikpak:dirpath url -o name=custom_filename.zip
 Downloads will be stored in 'dirpath'. If 'dirpath' is invalid,
 download will fallback to default 'My Pack' folder.
 
+The result is the new task as JSON with the fields "id", "name",
+"url", "size", "status" ("init"), "progress" and "created_at".
+
 Options:
 
 - "name": Custom filename for the downloaded file.
+
+### tasks
+
+List offline download tasks.
+
+```console
+rclone backend tasks remote: [options] [<arguments>+]
+```
+
+This command lists the offline download tasks. It is also
+available as "listoffline".
+
+Usage example:
+
+```console
+rclone backend tasks pikpak:
+```
+
+The result is a JSON list of tasks with the fields "id", "name",
+"size", "status" ("running", "complete" or "error"), "progress"
+(percentage), "error_msg" and "created_at".
+
+### deltask
+
+Delete an offline download task.
+
+```console
+rclone backend deltask remote: [options] [<arguments>+]
+```
+
+This command deletes the offline download task with the given ID.
+Files already downloaded are kept. It is also available as
+"deleteoffline".
+
+Usage example:
+
+```console
+rclone backend deltask pikpak: task_id
+```
 
 ### decompress
 

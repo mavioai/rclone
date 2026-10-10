@@ -66,3 +66,26 @@ func TestInternalShouldRetryHeaders(t *testing.T) {
 	assert.True(t, dt >= time.Hour-time.Second && dt <= time.Hour+time.Second)
 
 }
+
+func TestInternalIfMatch(t *testing.T) {
+	const md5 = "0123456789abcdef0123456789abcdef"
+	for _, test := range []struct {
+		name           string
+		md5            string
+		headers        swift.Headers
+		noLargeObjects bool
+		want           string
+	}{
+		{"no hash", "", swift.Headers{}, false, ""},
+		{"listed", md5, nil, false, ""},
+		{"listed without large objects", md5, nil, true, md5},
+		{"headed", md5, swift.Headers{"Etag": md5}, false, md5},
+		{"dynamic large object", md5, swift.Headers{"X-Object-Manifest": "c/p"}, false, ""},
+		{"static large object", md5, swift.Headers{"X-Static-Large-Object": "True"}, false, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			o := &Object{fs: &Fs{opt: Options{NoLargeObjects: test.noLargeObjects}}, md5: test.md5, headers: test.headers}
+			assert.Equal(t, test.want, o.ifMatch())
+		})
+	}
+}

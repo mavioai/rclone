@@ -1,0 +1,24 @@
+backend: weiyun
+name: Tencent Weiyun
+tier: Tier 4
+maintainers: External
+features_score: 5
+integration_tests: Untested
+data_integrity: Hash
+performance: High
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'TestWeiyun:'
+features:
+- About
+- CanHaveEmptyDirectories
+- DirCacheFlush
+- DirMove
+- Move
+- Purge
+- PutUnchecked
+hashes:
+- sha1
+precision: 3153600000000000000

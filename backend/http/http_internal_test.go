@@ -791,3 +791,32 @@ func TestRootCannotChangeHost(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, m["url"]+"/", f.String())
 }
+
+// TestOpenRangeIgnored checks that a range is read right from a server
+// that ignores it and sends the whole file.
+func TestOpenRangeIgnored(t *testing.T) {
+	fileServer := http.FileServer(http.Dir(filesPath))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Del("Range")
+		fileServer.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	f, err := NewFs(context.Background(), remoteName, "", configmap.Simple{"type": "http", "url": ts.URL})
+	require.NoError(t, err)
+	o, err := f.NewObject(context.Background(), "four/under four.txt")
+	require.NoError(t, err)
+	for _, test := range []struct {
+		option fs.OpenOption
+		want   string
+	}{
+		{&fs.RangeOption{Start: 1, End: 5}, "eetro"},
+		{&fs.SeekOption{Offset: 4}, "root"},
+	} {
+		fd, err := o.Open(context.Background(), test.option)
+		require.NoError(t, err)
+		data, err := io.ReadAll(fd)
+		require.NoError(t, err)
+		require.NoError(t, fd.Close())
+		assert.Equal(t, test.want, strings.TrimRight(string(data), "\r\n"), test.option.String())
+	}
+}

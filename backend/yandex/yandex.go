@@ -24,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
@@ -315,6 +316,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ReadMimeType:            true,
 		WriteMimeType:           false, // Yandex ignores the mime type we send
 		CanHaveEmptyDirectories: true,
+		// Estimates, not measurements
+		MaxFileStreams: 4,
+		MaxStreams:     10,
 	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
@@ -1066,9 +1070,36 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	return nil
 }
 
+// linkLifetime is how long a download link is used. Yandex states no
+// expiry for the links of /resources/download, so this is a conservative
+// estimate.
+const linkLifetime = 10 * time.Minute
+
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
-	// prepare download
+	key := linkcache.Key(o.fs.Name(), o.filePath(), strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10), o.md5sum)
+	return linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		// perform the download
+		var resp *http.Response
+		opts := rest.Opts{
+			RootURL: link.URL,
+			Method:  "GET",
+			Options: options,
+		}
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = o.fs.srv.Call(ctx, &opts)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return resp.Body, nil
+	})
+}
+
+// downloadLink requests the download link of the object.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
 	var resp *http.Response
 	var dl api.AsyncInfo
 	opts := rest.Opts{
@@ -1076,32 +1107,16 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		Path:       "/resources/download",
 		Parameters: url.Values{},
 	}
-
 	opts.Parameters.Set("path", o.fs.opt.Enc.FromStandardPath(o.filePath()))
-
-	err = o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &dl)
 		return shouldRetry(ctx, resp, err)
 	})
-
 	if err != nil {
 		return nil, err
 	}
-
-	// perform the download
-	opts = rest.Opts{
-		RootURL: dl.HRef,
-		Method:  "GET",
-		Options: options,
-	}
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, err
+	return &linkcache.Link{URL: dl.HRef}, nil
 }
 
 func (o *Object) upload(ctx context.Context, in io.Reader, overwrite bool, mimeType string, options ...fs.OpenOption) (err error) {

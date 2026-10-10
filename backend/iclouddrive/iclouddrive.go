@@ -11,7 +11,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -22,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/pacer"
 
 	"golang.org/x/text/unicode/norm"
@@ -82,7 +85,9 @@ type Object struct {
 	docID       string    // document ID of the object
 	itemID      string    // item ID of the object
 	etag        string
-	downloadURL string
+	downloadURL string // download link of the listing, if any
+
+	listingLinkFailed atomic.Bool // whether downloadURL failed to download
 }
 
 // find item by path. Will not return any children for the item
@@ -696,6 +701,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 		PartialUploads:          false,
+		FindByListing:           true,
+		// Estimates, not measurements
+		MaxFileStreams: 3,
+		MaxStreams:     8,
 	}).Fill(ctx, f)
 
 	rootID := f.rootID
@@ -819,6 +828,7 @@ func (o *Object) setMetaData(item *api.DriveItem) (err error) {
 	o.itemID = item.Itemid
 	o.etag = item.Etag
 	o.downloadURL = item.DownloadURL()
+	o.listingLinkFailed.Store(false)
 	return nil
 }
 
@@ -851,28 +861,69 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return io.NopCloser(bytes.NewBufferString("")), nil
 	}
 
-	var resp *http.Response
-	var err error
+	key := linkcache.Key(o.fs.Name(), o.driveID, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10), o.etag)
+	return linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		var resp *http.Response
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = o.fs.service.DownloadFile(ctx, link.URL, options)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			if fromListing, _ := link.Value.(bool); fromListing && ctx.Err() == nil {
+				// The listing's link may not work: request one instead
+				o.listingLinkFailed.Store(true)
+				return nil, &statusError{err: err, status: http.StatusGone}
+			}
+			if resp != nil {
+				err = &statusError{err: err, status: resp.StatusCode}
+			}
+			return nil, err
+		}
+		return resp.Body, nil
+	})
+}
 
-	if err = o.fs.pacer.Call(func() (bool, error) {
-		var url string
+// linkLifetime is how long a download link is used when it states no
+// expiry. iCloud's download links state theirs in the e parameter; this
+// is a conservative estimate for those that don't.
+const linkLifetime = 10 * time.Minute
 
-		//var doc *api.Document
-		//if o.docID == "" {
-		//doc, resp, err = o.fs.service.GetDocByItemID(ctx, o.itemID)
-		//}
-
-		// Can not get the download url on a item to work, so do it the hard way.
-		url, _, err = o.fs.service.GetDownloadURLByDriveID(ctx, o.driveID)
-
-		resp, err = o.fs.service.DownloadFile(ctx, url, options)
+// downloadLink returns the download link of the listing, or requests one
+// when the listing gave none or its link failed. The Value of the link
+// is true for the listing's link.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
+	if o.downloadURL != "" && !o.listingLinkFailed.Load() {
+		return &linkcache.Link{URL: o.downloadURL, Value: true}, nil
+	}
+	var url string
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var resp *http.Response
+		var err error
+		url, resp, err = o.fs.service.GetDownloadURLByDriveID(ctx, o.driveID)
 		return shouldRetry(ctx, resp, err)
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	return resp.Body, err
+	return &linkcache.Link{URL: url}, nil
 }
+
+// statusError is an error of a response with an HTTP status, so that a
+// refused download link is recognised.
+type statusError struct {
+	err    error
+	status int
+}
+
+// Error returns the error's message.
+func (e *statusError) Error() string { return e.err.Error() }
+
+// Unwrap returns the error the response gave.
+func (e *statusError) Unwrap() error { return e.err }
+
+// HTTPStatusCode returns the HTTP status of the response.
+func (e *statusError) HTTPStatusCode() int { return e.status }
 
 // Remote implements fs.Object.
 func (o *Object) Remote() string {

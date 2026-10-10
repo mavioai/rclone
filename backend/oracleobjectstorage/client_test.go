@@ -13,11 +13,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -102,4 +105,65 @@ func TestGzipEncoding(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "", md5sum)
 	})
+}
+
+// TestOpenIfMatch checks that reads are conditional on the ETag the
+// object was found with.
+func TestOpenIfMatch(t *testing.T) {
+	ctx := context.Background()
+	var (
+		mu         sync.Mutex
+		current    = "etag-1"
+		gotIfMatch []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == "GET" {
+			ifMatch := r.Header.Get("If-Match")
+			gotIfMatch = append(gotIfMatch, ifMatch)
+			if ifMatch != "" && ifMatch != current {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				_, _ = io.WriteString(w, `{"code":"IfMatchFailed","message":"The If-Match header did not match"}`)
+				return
+			}
+		}
+		w.Header().Set("ETag", current)
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Last-Modified", time.Unix(1000, 0).UTC().Format(http.TimeFormat))
+		_, _ = io.WriteString(w, "hello")
+	}))
+	defer srv.Close()
+
+	f, err := NewFs(ctx, "TestOOSIfMatch", "bucket", configmap.Simple{
+		"provider":  noAuth,
+		"namespace": "test",
+		"endpoint":  srv.URL,
+	})
+	require.NoError(t, err)
+	read := func(o fs.Object) error {
+		rc, err := o.Open(ctx)
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(io.Discard, rc)
+		return rc.Close()
+	}
+	o, err := f.NewObject(ctx, "file")
+	require.NoError(t, err)
+	require.NoError(t, read(o))
+
+	mu.Lock()
+	current = "etag-2"
+	mu.Unlock()
+	err = read(o)
+	require.Error(t, err)
+	status, _ := serve.ErrorStatus(err)
+	assert.Equal(t, http.StatusPreconditionFailed, status)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"etag-1", "etag-1"}, gotIfMatch)
 }

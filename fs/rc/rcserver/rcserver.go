@@ -23,9 +23,11 @@ import (
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/list"
+	"github.com/rclone/rclone/fs/objcache"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/rc/jobs"
 	"github.com/rclone/rclone/fs/rc/webgui"
+	"github.com/rclone/rclone/lib/connlimit"
 	libhttp "github.com/rclone/rclone/lib/http"
 	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/rclone/rclone/lib/random"
@@ -55,7 +57,8 @@ type Server struct {
 	files          http.Handler
 	pluginsHandler http.Handler
 	opt            *rc.Options
-	noAuth         bool // snapshot of opt.NoAuth at startup to prevent runtime mutation
+	noAuth         bool               // snapshot of opt.NoAuth at startup to prevent runtime mutation
+	limits         *connlimit.Limiter // the streams open when serving remote objects
 }
 
 func newServer(ctx context.Context, opt *rc.Options, mux *http.ServeMux) (*Server, error) {
@@ -108,6 +111,11 @@ func newServer(ctx context.Context, opt *rc.Options, mux *http.ServeMux) (*Serve
 		files:          fileHandler,
 		pluginsHandler: pluginsHandler,
 		noAuth:         opt.NoAuth,
+	}
+	if opt.Serve {
+		objcache.Default.SetLimits(time.Duration(opt.ServeCacheDuration), opt.ServeCacheSize)
+		objcache.Default.SetPollInterval(time.Duration(opt.ServePollInterval))
+		s.limits = connlimit.New(0, 0) // limits given per stream, by s.open
 	}
 
 	var err error
@@ -429,13 +437,7 @@ func (s *Server) serveRemote(w http.ResponseWriter, r *http.Request, path string
 
 		directory.Serve(w, r)
 	} else {
-		path = strings.Trim(path, "/")
-		o, err := f.NewObject(r.Context(), path)
-		if err != nil {
-			writeError(path, nil, w, fmt.Errorf("failed to find object: %w", err), http.StatusInternalServerError)
-			return
-		}
-		serve.Object(w, r, o)
+		s.serveObject(w, r, f, strings.Trim(path, "/"))
 	}
 }
 

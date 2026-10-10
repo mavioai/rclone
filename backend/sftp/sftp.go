@@ -1599,6 +1599,10 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 	if err != nil {
 		return nil, fmt.Errorf("NewFs: %w", err)
 	}
+	if _, ok := c.sftpClient.HasExtension("hardlink@openssh.com"); !ok {
+		// Hard links need the server's extension
+		f.features.Link = nil
+	}
 	// Check remote shell type, try to auto-detect if not configured and save to config for later
 	if f.opt.ShellType != "" {
 		f.shellType = f.opt.ShellType
@@ -1988,6 +1992,46 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstObj, err := f.NewObject(ctx, remote)
 	if err != nil {
 		return nil, fmt.Errorf("Copy NewObject failed: %w", err)
+	}
+	return dstObj, nil
+}
+
+// Link hard links src to remote, both then sharing the file's data,
+// with the server's hardlink@openssh.com extension.
+//
+// If it isn't possible then return fs.ErrorCantLink
+func (f *Fs) Link(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't hard link - not same remote type")
+		return nil, fs.ErrorCantLink
+	}
+	err := f.mkParentDir(ctx, remote)
+	if err != nil {
+		return nil, fmt.Errorf("Link mkParentDir failed: %w", err)
+	}
+	c, err := f.getSftpConnection(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("Link: %w", err)
+	}
+	if _, ok := c.sftpClient.HasExtension("hardlink@openssh.com"); !ok {
+		f.putSftpConnection(&c, nil)
+		return nil, fs.ErrorCantLink
+	}
+	err = c.sftpClient.Link(srcObj.path(), f.remotePath(remote))
+	f.putSftpConnection(&c, err)
+	if err != nil {
+		var sftpErr *sftp.StatusError
+		if errors.As(err, &sftpErr) && (sftpErr.FxCode() == sftp.ErrSSHFxOpUnsupported || sftpErr.FxCode() == sftp.ErrSSHFxFailure) {
+			// Unsupported, or failed as across file systems
+			fs.Debugf(src, "Can't hard link: %v", err)
+			return nil, fs.ErrorCantLink
+		}
+		return nil, fmt.Errorf("Link failed: %w", err)
+	}
+	dstObj, err := f.NewObject(ctx, remote)
+	if err != nil {
+		return nil, fmt.Errorf("Link NewObject failed: %w", err)
 	}
 	return dstObj, nil
 }
@@ -2846,6 +2890,7 @@ var (
 	_ fs.Fs             = &Fs{}
 	_ fs.PutStreamer    = &Fs{}
 	_ fs.Mover          = &Fs{}
+	_ fs.Linker         = &Fs{}
 	_ fs.Copier         = &Fs{}
 	_ fs.DirMover       = &Fs{}
 	_ fs.DirSetModTimer = &Fs{}

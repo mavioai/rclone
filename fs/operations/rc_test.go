@@ -893,3 +893,25 @@ func TestRcHashsumFile(t *testing.T) {
 	assert.Equal(t, "md5", out["hashType"])
 	assert.Equal(t, "0ef726ce9b1a7692357ff70dd321d595", out["hash"])
 }
+
+// operations/addurl, operations/listoffline, operations/deleteoffline
+func TestRcOffline(t *testing.T) {
+	ctx := context.Background()
+	r, callAdd := rcNewRun(t, "operations/addurl")
+	_, callList := rcNewRun(t, "operations/listoffline")
+	_, callDelete := rcNewRun(t, "operations/deleteoffline")
+
+	// Local filesystem does not support offline download
+	in := rc.Params{
+		"fs":  r.FremoteName,
+		"url": "https://example.com/test.zip",
+	}
+	_, err := callAdd.Fn(ctx, in)
+	assert.Error(t, err)
+
+	_, err = callList.Fn(ctx, rc.Params{"fs": r.FremoteName})
+	assert.Error(t, err)
+
+	_, err = callDelete.Fn(ctx, rc.Params{"fs": r.FremoteName, "task_id": "123"})
+	assert.Error(t, err)
+}

@@ -155,6 +155,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.dirCache = dircache.New(root, rootID, f)
 
 	f.features = (&fs.Features{
+		FindByListing:           true, // NewObject lists the parent folder
 		CanHaveEmptyDirectories: true,
 		CaseInsensitive:         true,
 	}).Fill(ctx, f)

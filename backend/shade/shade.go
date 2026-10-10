@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -844,109 +846,147 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 	fs.FixRangeOption(options, o.size)
 
+	// The presigned URL the download API redirects to is kept, so that
+	// the opens of one object share it instead of each asking for it
+	key := linkcache.Key(o.fs.Name(), o.fs.drive, o.fs.buildFullPath(o.remote), strconv.FormatInt(o.size, 10), strconv.FormatInt(o.mtime, 10))
+	in, err := linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.openURL(ctx, link.URL, options)
+	})
+	if !errors.Is(err, errNoRedirect) {
+		return in, err
+	}
+
+	// The download API answers with the content itself: ask it for the range
+	res, err := o.download(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode == http.StatusTemporaryRedirect {
+		presignedURL, err := readPresignedURL(res)
+		if err != nil {
+			return nil, err
+		}
+		return o.openURL(ctx, presignedURL, options)
+	}
+	return res.Body, nil
+}
+
+// linkLifetime is how long a presigned download URL is kept when it
+// states no expiry: Shade does not say how long they last, and a
+// refused one is requested again.
+const linkLifetime = 10 * time.Minute
+
+// errNoRedirect reports that the download API answered with the content
+// itself rather than with a redirect to it.
+var errNoRedirect = errors.New("download did not redirect")
+
+// download asks the download API for the object, with the options and
+// without following its redirect. It returns a 2xx or 307 answer, the
+// error of any other.
+func (o *Object) download(ctx context.Context, options []fs.OpenOption) (*http.Response, error) {
 	token, err := o.fs.refreshJWTToken(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	fullPath := o.fs.buildFullPath(o.remote)
-	// Construct the initial request URL
-	downloadURL := fmt.Sprintf("%s/%s/fs/download?path=%s", o.fs.endpoint, o.fs.drive, fullPath)
-
-	// Create HTTP request manually
-	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-	if err != nil {
-		fs.Debugf(o.fs, "Failed to create request: %v", err)
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: fmt.Sprintf("%s/%s/fs/download?path=%s", o.fs.endpoint, o.fs.drive, o.fs.buildFullPath(o.remote)),
+		ExtraHeaders: map[string]string{
+			"Authorization": "Bearer " + token,
+		},
+		Options:      options,
+		NoRedirect:   true,
+		IgnoreStatus: true,
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	// Use pacer to manage retries and rate limiting
 	var res *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
-
-		if res != nil {
-			err = res.Body.Close()
-			if err != nil {
-				return false, err
-			}
+		var err error
+		res, err = o.fs.srv.Call(ctx, &opts)
+		if err == nil && (res.StatusCode < 200 || res.StatusCode > 299) && res.StatusCode != http.StatusTemporaryRedirect {
+			err = newDownloadError(res, "download")
 		}
-
-		client := http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse // Don't follow redirects
-			},
-		}
-		res, err = client.Do(req)
-		if err != nil {
-			return shouldRetry(ctx, nil, err)
-		}
-		return fserrors.ShouldRetryHTTP(res, retryErrorCodes), nil
+		return shouldRetry(ctx, res, err)
 	})
-
 	if err != nil {
 		return nil, fmt.Errorf("download request failed: %w", err)
 	}
-	if res == nil {
-		return nil, fmt.Errorf("no response received from initial request")
+	return res, nil
+}
+
+// downloadLink asks the download API for the presigned URL it redirects
+// to.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
+	res, err := o.download(ctx, nil)
+	if err != nil {
+		return nil, err
 	}
+	if res.StatusCode != http.StatusTemporaryRedirect {
+		_ = res.Body.Close()
+		return nil, errNoRedirect
+	}
+	presignedURL, err := readPresignedURL(res)
+	if err != nil {
+		return nil, err
+	}
+	return &linkcache.Link{URL: presignedURL}, nil
+}
 
-	// Handle response based on status code
-	switch res.StatusCode {
-	case http.StatusOK:
-		return res.Body, nil
+// readPresignedURL reads the presigned URL from the body of the redirect
+// res and closes it.
+func readPresignedURL(res *http.Response) (presignedURL string, err error) {
+	bodyBytes, err := io.ReadAll(res.Body)
+	fs.CheckClose(res.Body, &err) // Close body after reading
+	if err != nil {
+		return "", fmt.Errorf("failed to read redirect body: %w", err)
+	}
+	return strings.TrimSpace(string(bodyBytes)), nil
+}
 
-	case http.StatusTemporaryRedirect:
-		// Read the presigned URL from the body
-		bodyBytes, err := io.ReadAll(res.Body)
-		fs.CheckClose(res.Body, &err) // Close body after reading
-		if err != nil {
-			return nil, fmt.Errorf("failed to read redirect body: %w", err)
+// openURL opens the presigned URL u with the options.
+func (o *Object) openURL(ctx context.Context, u string, options []fs.OpenOption) (io.ReadCloser, error) {
+	opts := rest.Opts{
+		Method:       "GET",
+		RootURL:      u,
+		Options:      options,
+		IgnoreStatus: true,
+	}
+	var res *http.Response
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
+		res, err = o.fs.srv.Call(ctx, &opts)
+		if err == nil && res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
+			err = newDownloadError(res, "presigned URL")
 		}
+		return shouldRetry(ctx, res, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("presigned URL request failed: %w", err)
+	}
+	return res.Body, nil
+}
 
-		presignedURL := strings.TrimSpace(string(bodyBytes))
-		o.original = presignedURL //Save for later for hashing
+// downloadError is an error answer of a download.
+type downloadError struct {
+	status int
+	msg    string
+}
 
-		client := rest.NewClient(fshttp.NewClient(ctx)).SetRoot(presignedURL)
-		var downloadRes *http.Response
-		opts := rest.Opts{
-			Method:  "GET",
-			Path:    "",
-			Options: options,
-		}
-
-		err = o.fs.pacer.Call(func() (bool, error) {
-			downloadRes, err = client.Call(ctx, &opts)
-			if err != nil {
-				return shouldRetry(ctx, downloadRes, err)
-			}
-			if downloadRes == nil {
-				return false, fmt.Errorf("failed to fetch presigned URL")
-			}
-			return fserrors.ShouldRetryHTTP(downloadRes, retryErrorCodes), nil
-		})
-
-		if err != nil {
-			return nil, fmt.Errorf("presigned URL request failed: %w", err)
-		}
-		if downloadRes == nil {
-			return nil, fmt.Errorf("no response received from presigned URL request")
-		}
-
-		if downloadRes.StatusCode != http.StatusOK && downloadRes.StatusCode != http.StatusPartialContent {
-			body, _ := io.ReadAll(downloadRes.Body)
-			fs.CheckClose(downloadRes.Body, &err)
-			return nil, fmt.Errorf("presigned URL request failed with status %d: %q", downloadRes.StatusCode, string(body))
-		}
-
-		return downloadRes.Body, nil
-
-	default:
-		body, _ := io.ReadAll(res.Body)
-		fs.CheckClose(res.Body, &err)
-		return nil, fmt.Errorf("download failed with status %d: %q", res.StatusCode, string(body))
+// newDownloadError reads and closes the error answer res of the request
+// what.
+func newDownloadError(res *http.Response, what string) error {
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
+	_ = res.Body.Close()
+	return &downloadError{
+		status: res.StatusCode,
+		msg:    fmt.Sprintf("%s failed with status %d: %q", what, res.StatusCode, string(body)),
 	}
 }
+
+// Error returns the message of e.
+func (e *downloadError) Error() string { return e.msg }
+
+// StatusCode returns the HTTP status of e.
+func (e *downloadError) StatusCode() int { return e.status }
 
 // Update in to the object with the modTime given of the given size
 //

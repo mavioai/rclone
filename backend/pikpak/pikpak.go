@@ -608,6 +608,10 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		ReadMimeType:            true, // can read the mime type of objects
 		CanHaveEmptyDirectories: true, // can have empty directories
 		NoMultiThreading:        true, // can't have multiple threads downloading
+		FindByListing:           true, // NewObject lists the parent directory
+		// Estimates, not measurements
+		MaxFileStreams: 3,
+		MaxStreams:     8,
 	}).Fill(ctx, f)
 
 	// new device id if necessary
@@ -1449,10 +1453,20 @@ func (f *Fs) uploadByResumable(ctx context.Context, in io.Reader, name string, s
 		return fmt.Errorf("failed to create upload client: %w", err)
 	}
 	counter := readers.NewCountingReader(in)
+	var uploadReader io.Reader = counter
+	if size > 0 {
+		uploadReader = &io.LimitedReader{
+			R: counter,
+			N: size,
+		}
+	}
 	req := &s3.PutObjectInput{
 		Bucket: &p.Bucket,
 		Key:    &p.Key,
-		Body:   io.NopCloser(counter),
+		Body:   io.NopCloser(uploadReader),
+	}
+	if size >= 0 {
+		req.ContentLength = &size
 	}
 	// Apply upload options
 	for _, option := range options {
@@ -1482,6 +1496,14 @@ func (f *Fs) uploadByResumable(ctx context.Context, in io.Reader, name string, s
 	})
 	if err != nil {
 		return err
+	}
+	// Check the input wasn't longer than declared, as only size
+	// bytes were read from it
+	if size > 0 {
+		var extra [1]byte
+		if n, _ := io.ReadFull(counter, extra[:]); n > 0 {
+			return fmt.Errorf("expected %d bytes in input, but got more", size)
+		}
 	}
 	// Check for truncation of input
 	if size >= 0 && int64(counter.BytesRead()) != size {
@@ -1701,10 +1723,40 @@ rclone backend addurl pikpak:dirpath url -o name=custom_filename.zip
 ` + "```" + `
 
 Downloads will be stored in 'dirpath'. If 'dirpath' is invalid,
-download will fallback to default 'My Pack' folder.`,
+download will fallback to default 'My Pack' folder.
+
+The result is the new task as JSON with the fields "id", "name",
+"url", "size", "status" ("init"), "progress" and "created_at".`,
 	Opts: map[string]string{
 		"name": "Custom filename for the downloaded file.",
 	},
+}, {
+	Name:  "tasks",
+	Short: "List offline download tasks.",
+	Long: `This command lists the offline download tasks. It is also
+available as "listoffline".
+
+Usage example:
+
+` + "```console" + `
+rclone backend tasks pikpak:
+` + "```" + `
+
+The result is a JSON list of tasks with the fields "id", "name",
+"size", "status" ("running", "complete" or "error"), "progress"
+(percentage), "error_msg" and "created_at".`,
+}, {
+	Name:  "deltask",
+	Short: "Delete an offline download task.",
+	Long: `This command deletes the offline download task with the given ID.
+Files already downloaded are kept. It is also available as
+"deleteoffline".
+
+Usage example:
+
+` + "```console" + `
+rclone backend deltask pikpak: task_id
+` + "```",
 }, {
 	Name:  "decompress",
 	Short: "Request decompress of a file/files in a folder.",
@@ -1748,11 +1800,18 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		if len(arg) != 1 {
 			return nil, errors.New("need exactly 1 argument")
 		}
-		filename := ""
-		if name, ok := opt["name"]; ok {
-			filename = name
+		return f.AddURL(ctx, arg[0], opt)
+	case "tasks", "listoffline":
+		return f.ListOfflineTasks(ctx)
+	case "deltask", "deleteoffline":
+		if len(arg) != 1 {
+			return nil, errors.New("need exactly 1 argument (task_id)")
 		}
-		return f.addURL(ctx, arg[0], filename, "")
+		err := f.DeleteOfflineTask(ctx, arg[0])
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"status": "success", "deleted": arg[0]}, nil
 	case "decompress":
 		filename := ""
 		if len(arg) > 0 {
@@ -1771,6 +1830,65 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 	default:
 		return nil, fs.ErrorCommandNotFound
 	}
+}
+
+// AddURL submits a remote URL to be downloaded server-side.
+func (f *Fs) AddURL(ctx context.Context, url string, opt map[string]string) (*fs.OfflineTask, error) {
+	name := ""
+	path := ""
+	if n, ok := opt["name"]; ok {
+		name = n
+	}
+	if p, ok := opt["path"]; ok {
+		path = p
+	}
+	task, err := f.addURL(ctx, url, name, path)
+	if err != nil {
+		return nil, err
+	}
+	fileSize, _ := strconv.ParseInt(task.FileSize, 10, 64)
+	return &fs.OfflineTask{
+		ID:        task.ID,
+		Name:      task.Name,
+		URL:       url,
+		Size:      fileSize,
+		Status:    fs.OfflineTaskStatusInit,
+		CreatedAt: time.Now(),
+	}, nil
+}
+
+// ListOfflineTasks returns server-side offline download tasks.
+func (f *Fs) ListOfflineTasks(ctx context.Context) ([]*fs.OfflineTask, error) {
+	apiTasks, err := f.listTasks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tasks := make([]*fs.OfflineTask, 0, len(apiTasks))
+	for _, t := range apiTasks {
+		status := fs.OfflineTaskStatusRunning
+		switch t.Phase {
+		case "PHASE_TYPE_COMPLETE":
+			status = fs.OfflineTaskStatusComplete
+		case "PHASE_TYPE_ERROR":
+			status = fs.OfflineTaskStatusError
+		}
+		fileSize, _ := strconv.ParseInt(t.FileSize, 10, 64)
+		tasks = append(tasks, &fs.OfflineTask{
+			ID:        t.ID,
+			Name:      t.Name,
+			Size:      fileSize,
+			Status:    status,
+			Progress:  float64(t.Progress),
+			ErrorMsg:  t.Message,
+			CreatedAt: time.Time(t.CreatedTime),
+		})
+	}
+	return tasks, nil
+}
+
+// DeleteOfflineTask deletes a server-side offline download task.
+func (f *Fs) DeleteOfflineTask(ctx context.Context, taskID string) error {
+	return f.deleteTask(ctx, taskID, false)
 }
 
 // ------------------------------------------------------------
@@ -2057,19 +2175,20 @@ var (
 	// _ fs.ListRer         = (*Fs)(nil)
 	// _ fs.ChangeNotifier  = (*Fs)(nil)
 	// _ fs.PutStreamer     = (*Fs)(nil)
-	_ fs.Fs              = (*Fs)(nil)
-	_ fs.Purger          = (*Fs)(nil)
-	_ fs.CleanUpper      = (*Fs)(nil)
-	_ fs.Copier          = (*Fs)(nil)
-	_ fs.Mover           = (*Fs)(nil)
-	_ fs.DirMover        = (*Fs)(nil)
-	_ fs.Commander       = (*Fs)(nil)
-	_ fs.DirCacheFlusher = (*Fs)(nil)
-	_ fs.PublicLinker    = (*Fs)(nil)
-	_ fs.Abouter         = (*Fs)(nil)
-	_ fs.UserInfoer      = (*Fs)(nil)
-	_ fs.Object          = (*Object)(nil)
-	_ fs.MimeTyper       = (*Object)(nil)
-	_ fs.IDer            = (*Object)(nil)
-	_ fs.ParentIDer      = (*Object)(nil)
+	_ fs.Fs                = (*Fs)(nil)
+	_ fs.Purger            = (*Fs)(nil)
+	_ fs.CleanUpper        = (*Fs)(nil)
+	_ fs.Copier            = (*Fs)(nil)
+	_ fs.Mover             = (*Fs)(nil)
+	_ fs.DirMover          = (*Fs)(nil)
+	_ fs.Commander         = (*Fs)(nil)
+	_ fs.OfflineDownloader = (*Fs)(nil)
+	_ fs.DirCacheFlusher   = (*Fs)(nil)
+	_ fs.PublicLinker      = (*Fs)(nil)
+	_ fs.Abouter           = (*Fs)(nil)
+	_ fs.UserInfoer        = (*Fs)(nil)
+	_ fs.Object            = (*Object)(nil)
+	_ fs.MimeTyper         = (*Object)(nil)
+	_ fs.IDer              = (*Object)(nil)
+	_ fs.ParentIDer        = (*Object)(nil)
 )

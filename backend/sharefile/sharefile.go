@@ -80,6 +80,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,6 +94,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
@@ -378,6 +380,7 @@ func errorHandler(resp *http.Response) error {
 	if body != nil {
 		_ = json.Unmarshal(body, &e)
 	}
+	e.StatusCode = resp.StatusCode
 	return &e
 }
 
@@ -1295,6 +1298,36 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	fs.FixRangeOption(options, o.size)
+	key := linkcache.Key(o.fs.Name(), o.id, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10), o.md5)
+	return linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		opts := rest.Opts{
+			Path:    "",
+			RootURL: link.URL,
+			Method:  "GET",
+			Options: options,
+		}
+		var resp *http.Response
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = o.fs.srv.Call(ctx, &opts)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("open: %w", err)
+		}
+		return resp.Body, nil
+	})
+}
+
+// linkLifetime is how long a download link is used. ShareFile states no
+// expiry for the DownloadUrl of a download specification, and its
+// download tokens are short lived, so this is a conservative estimate.
+const linkLifetime = 5 * time.Minute
+
+// downloadLink requests the download specification of the object and
+// returns its download link.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
 	opts := rest.Opts{
 		Method: "GET",
 		Path:   "/Items(" + o.id + ")/Download",
@@ -1304,29 +1337,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	var resp *http.Response
 	var dl api.DownloadSpecification
-	err = o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &dl)
 		return shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open: fetch download specification: %w", err)
 	}
-
-	fs.FixRangeOption(options, o.size)
-	opts = rest.Opts{
-		Path:    "",
-		RootURL: dl.URL,
-		Method:  "GET",
-		Options: options,
-	}
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("open: %w", err)
-	}
-	return resp.Body, err
+	return &linkcache.Link{URL: dl.URL}, nil
 }
 
 // Update the object with the contents of the io.Reader, modTime and size

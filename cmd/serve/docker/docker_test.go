@@ -537,7 +537,16 @@ func testMountAPI(t *testing.T, sockAddr string) {
 	assert.NoError(t, err)
 	time.Sleep(tempDelay)
 
-	text2, err := os.ReadFile(filepath.Join(path1, "txt"))
+	// WinFsp's asynchronous writeback may take a while to reach the
+	// underlying path, so poll for the file before checking it
+	var text2 []byte
+	for range 50 {
+		text2, err = os.ReadFile(filepath.Join(path1, "txt"))
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	assert.NoError(t, err)
 	if runtime.GOOS != "windows" {
 		// this check sometimes fails on windows - ignore

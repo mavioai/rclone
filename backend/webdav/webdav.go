@@ -41,6 +41,7 @@ import (
 	"github.com/rclone/rclone/fs/list"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
+	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 )
 
@@ -257,6 +258,7 @@ type Object struct {
 	modTime     time.Time // modification time of the object
 	sha1        string    // SHA-1 of the object content if known
 	md5         string    // MD5 of the object content if known
+	etag        string    // strong entity tag of the object if known
 }
 
 // ------------------------------------------------------------
@@ -836,6 +838,7 @@ var owncloudProps = []byte(`<?xml version="1.0"?>
   <d:getlastmodified />
   <d:getcontentlength />
   <d:resourcetype />
+  <d:getetag />
   <oc:checksums />
   <oc:permissions />
  </d:prop>
@@ -849,6 +852,7 @@ var standardProps = []byte(`<?xml version="1.0"?>
   <d:getlastmodified/>
   <d:getcontentlength/>
   <d:resourcetype/>
+  <d:getetag/>
  </d:prop>
 </d:propfind>
 `)
@@ -1476,6 +1480,7 @@ func (o *Object) setMetaData(info *api.Prop) (err error) {
 	o.hasMetaData = true
 	o.size = info.Size
 	o.modTime = time.Time(info.Modified)
+	o.etag = strongETag(info.ETag)
 	if o.fs.hasOCMD5 || o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
 		hashes := info.Hashes()
 		if o.fs.hasOCSHA1 || o.fs.hasMESHA1 {
@@ -1486,6 +1491,22 @@ func (o *Object) setMetaData(info *api.Prop) (err error) {
 		}
 	}
 	return nil
+}
+
+// VersionTag returns the strong entity tag the object was found with,
+// or ""
+func (o *Object) VersionTag() string {
+	return o.etag
+}
+
+// strongETag returns etag if it is a strong entity tag, which If-Match
+// can compare, or "".
+func strongETag(etag string) string {
+	etag = strings.TrimSpace(etag)
+	if len(etag) < 2 || etag[0] != '"' || etag[len(etag)-1] != '"' {
+		return ""
+	}
+	return etag
 }
 
 // readMetaData gets the metadata if it hasn't already been fetched
@@ -1588,6 +1609,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 			// in-memory modtime identical to the one a fresh
 			// listing returns
 			o.modTime = modTime.Truncate(time.Second)
+			o.etag = "" // the server may change it with the properties
 			if o.fs.canRecalcHash && (o.sha1 != "" || o.md5 != "") {
 				err = o.recalculateHash(ctx)
 				if err != nil {
@@ -1628,12 +1650,23 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		},
 		AuthRedirect: o.fs.opt.AuthRedirect, // allow redirects to preserve Auth
 	}
+	if o.etag != "" {
+		// Read the version found, so that a file replaced since
+		// fails with 412 Precondition Failed instead of returning
+		// mixed content.
+		opts.ExtraHeaders["If-Match"] = o.etag
+	}
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
 		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusOK && readers.RangeRequested(options) {
+		// The server ignored the range and sent the whole file
+		fs.Debugf(o, "Server returned full content instead of range")
+		return readers.SkipToRange(resp.Body, o.size, options)
 	}
 	return resp.Body, err
 }
@@ -1680,6 +1713,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	// read metadata from remote
 	o.hasMetaData = false
+	o.etag = ""
 	err = o.readMetaData(ctx)
 	if err != nil {
 		return err
@@ -1806,13 +1840,14 @@ func (o *Object) Remove(ctx context.Context) error {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = (*Fs)(nil)
-	_ fs.Purger      = (*Fs)(nil)
-	_ fs.PutStreamer = (*Fs)(nil)
-	_ fs.Copier      = (*Fs)(nil)
-	_ fs.Mover       = (*Fs)(nil)
-	_ fs.DirMover    = (*Fs)(nil)
-	_ fs.ListPer     = (*Fs)(nil)
-	_ fs.Abouter     = (*Fs)(nil)
-	_ fs.Object      = (*Object)(nil)
+	_ fs.Fs            = (*Fs)(nil)
+	_ fs.Purger        = (*Fs)(nil)
+	_ fs.PutStreamer   = (*Fs)(nil)
+	_ fs.Copier        = (*Fs)(nil)
+	_ fs.Mover         = (*Fs)(nil)
+	_ fs.DirMover      = (*Fs)(nil)
+	_ fs.ListPer       = (*Fs)(nil)
+	_ fs.Abouter       = (*Fs)(nil)
+	_ fs.Object        = (*Object)(nil)
+	_ fs.VersionTagger = (*Object)(nil)
 )

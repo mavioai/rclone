@@ -342,6 +342,7 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 	// Note 2: features.Fill() points features.PutStream to our PutStream,
 	// but features.Mask() will nullify it if wrappedFs does not have it.
 	f.features = (&fs.Features{
+		FindByListing:            true, // NewObject lists the base remote's folder
 		CaseInsensitive:          true,
 		DuplicateFiles:           true,
 		ReadMimeType:             false, // Object.MimeType not supported

@@ -1,0 +1,73 @@
+---
+# Release builds of Mavio's fork of rclone.
+#
+# A tag v<rclone version>-mavio builds rclone without cgo for Linux, macOS
+# and Windows on amd64 and arm64, and attaches the zips and their SHA-256
+# sums to the tag's release, creating it from the tag's message if needed.
+# Mavio pins these assets in its mise.toml.
+
+name: mavio release
+
+on:
+  push:
+    tags:
+      - 'v*-mavio'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and release, e.g. v1.75.2-mavio
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.repository == 'mavioai/rclone'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '~1.26.9'
+          check-latest: true
+
+      - name: Cross-compile
+        run: go run bin/cross-compile.go -compile-only -include '^(linux|darwin|windows)/(amd64|arm64)$' "$TAG"
+
+      - name: Package
+        working-directory: build
+        run: |
+          for dir in rclone-*/; do
+            zip -r9 "${dir%/}.zip" "$dir"
+          done
+          sha256sum rclone-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Check the binaries' architectures
+        working-directory: build
+        run: |
+          file rclone-*/rclone* | tee files.txt
+          grep -q 'linux-amd64/rclone: .*x86-64.*statically linked' files.txt
+          grep -q 'linux-arm64/rclone: .*ARM aarch64.*statically linked' files.txt
+          grep -q 'osx-amd64/rclone: .*x86_64' files.txt
+          grep -q 'osx-arm64/rclone: .*arm64' files.txt
+          grep -q 'windows-amd64/rclone.exe: .*x86-64' files.txt
+          grep -q 'windows-arm64/rclone.exe: .*Aarch64' files.txt
+
+      - name: Release
+        working-directory: build
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-from-tag
+          fi
+          gh release upload "$TAG" rclone-*.zip SHA256SUMS.txt --clobber

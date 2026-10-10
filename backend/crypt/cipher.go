@@ -885,6 +885,27 @@ func (c *Cipher) newDecrypterSeek(ctx context.Context, open OpenRangeSeek, offse
 	return fh, nil
 }
 
+// newDecrypterSeekNonce creates a new file handle decrypting on the fly
+// for a file whose nonce is known from an earlier read of its header, so
+// that it opens the underlying object once, where the data starts.
+func (c *Cipher) newDecrypterSeekNonce(ctx context.Context, open OpenRangeSeek, fileNonce nonce, offset, limit int64) (*decrypter, error) {
+	fh := &decrypter{
+		rc:           io.NopCloser(bytes.NewReader(nil)),
+		c:            c,
+		buf:          c.getBlock(),
+		readBuf:      c.getBlock(),
+		limit:        -1,
+		open:         open,
+		nonce:        fileNonce,
+		initialNonce: fileNonce,
+	}
+	if _, err := fh.RangeSeek(ctx, offset, io.SeekStart, limit); err != nil {
+		_ = fh.Close()
+		return nil, err
+	}
+	return fh, nil
+}
+
 // read data into internal buffer - call with fh.mu held
 func (fh *decrypter) fillBuffer() (err error) {
 	// FIXME should overlap the reads with a go-routine and 2 buffers?

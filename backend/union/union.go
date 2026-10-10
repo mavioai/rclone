@@ -994,6 +994,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	canMove, slowHash := true, false
 	for _, f := range upstreams {
 		features = features.Mask(ctx, f) // Mask all upstream fs
+		features.FindByListing = false   // a lookup asks every upstream, whatever they do
 		if !operations.CanServerSideMove(f) {
 			canMove = false
 		}

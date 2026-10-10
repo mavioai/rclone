@@ -169,6 +169,14 @@ type IDer interface {
 	ID() string
 }
 
+// VersionTagger is an optional interface for Object
+type VersionTagger interface {
+	// VersionTag returns a tag of the version of the content that
+	// the Object was found with, such as the ETag of the storage, or
+	// "" if not known. It changes when the content is replaced.
+	VersionTag() string
+}
+
 // ParentIDer is an optional interface for Object
 type ParentIDer interface {
 	// ParentID returns the ID of the parent directory if known or nil if not

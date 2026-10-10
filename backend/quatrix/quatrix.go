@@ -30,6 +30,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
@@ -1016,30 +1017,65 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return nil, errors.New("can't download - no id")
 	}
 
-	linkID, err := o.fs.downloadLink(ctx, o.id)
-	if err != nil {
-		return nil, err
-	}
-
 	fs.FixRangeOption(options, o.size)
 
-	opts := rest.Opts{
-		Method:  "GET",
-		Path:    "/file/download/" + linkID,
-		Options: options,
+	key := linkcache.Key(o.fs.Name(), o.id, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10))
+	fetch := func(ctx context.Context) (*linkcache.Link, error) {
+		linkID, err := o.fs.downloadLink(ctx, o.id)
+		if err != nil {
+			return nil, err
+		}
+		return &linkcache.Link{Value: linkID}, nil // a link ID, not a URL
 	}
+	return linkcache.Default.Open(ctx, key, linkLifetime, fetch, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		opts := rest.Opts{
+			Method:  "GET",
+			Path:    "/file/download/" + link.Value.(string),
+			Options: options,
+		}
 
-	var resp *http.Response
-
-	err = o.fs.pacer.Call(func() (bool, error) {
-		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
+		var resp *http.Response
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = o.fs.srv.Call(ctx, &opts)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			if resp != nil {
+				status := resp.StatusCode
+				if status >= 400 && status < 500 && status != http.StatusTooManyRequests {
+					// A link ID may serve one download: whatever 4xx
+					// a used one gets, have a new one requested
+					status = http.StatusGone
+				}
+				err = &statusError{err: err, status: status}
+			}
+			return nil, err
+		}
+		return resp.Body, nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, err
 }
+
+// linkLifetime is how long a download link is used. Quatrix states no
+// expiry for the links of file/download-link, so this is a conservative
+// estimate.
+const linkLifetime = 10 * time.Minute
+
+// statusError is an error of a response with the response's HTTP
+// status, so that a refused download link is recognised.
+type statusError struct {
+	err    error
+	status int
+}
+
+// Error returns the error's message.
+func (e *statusError) Error() string { return e.err.Error() }
+
+// Unwrap returns the error the response gave.
+func (e *statusError) Unwrap() error { return e.err }
+
+// HTTPStatusCode returns the HTTP status of the response.
+func (e *statusError) HTTPStatusCode() int { return e.status }
 
 func (f *Fs) downloadLink(ctx context.Context, id string) (linkID string, err error) {
 	linkParams := &api.IDList{

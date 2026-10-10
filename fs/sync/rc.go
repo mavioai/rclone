@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 
+	"github.com/rclone/rclone/fs/objcache"
 	"github.com/rclone/rclone/fs/rc"
 )
 
@@ -39,6 +40,11 @@ func rcSyncCopyMove(ctx context.Context, in rc.Params, name string) (out rc.Para
 	dstFs, err := rc.GetFsNamed(ctx, in, "dstFs")
 	if err != nil {
 		return nil, err
+	}
+	// Drop the cached objects the transfer may change once it ends
+	defer objcache.Default.Drop(dstFs, "")
+	if name == "move" {
+		defer objcache.Default.Drop(srcFs, "")
 	}
 	createEmptySrcDirs, err := in.GetBool("createEmptySrcDirs")
 	if rc.NotErrParamNotFound(err) {

@@ -1522,6 +1522,33 @@ func PublicLink(ctx context.Context, f fs.Fs, remote string, expire fs.Duration,
 	return doPublicLink(ctx, remote, expire, unlink)
 }
 
+// AddURL submits a remote URL to be downloaded server-side.
+func AddURL(ctx context.Context, f fs.Fs, url string, opt map[string]string) (*fs.OfflineTask, error) {
+	doAddURL := f.Features().AddURL
+	if doAddURL == nil {
+		return nil, fmt.Errorf("%v doesn't support offline downloads", f)
+	}
+	return doAddURL(ctx, url, opt)
+}
+
+// ListOfflineTasks retrieves the list of server-side offline download tasks.
+func ListOfflineTasks(ctx context.Context, f fs.Fs) ([]*fs.OfflineTask, error) {
+	doList := f.Features().ListOfflineTasks
+	if doList == nil {
+		return nil, fmt.Errorf("%v doesn't support listing offline tasks", f)
+	}
+	return doList(ctx)
+}
+
+// DeleteOfflineTask deletes a server-side offline download task.
+func DeleteOfflineTask(ctx context.Context, f fs.Fs, taskID string) error {
+	doDelete := f.Features().DeleteOfflineTask
+	if doDelete == nil {
+		return fmt.Errorf("%v doesn't support deleting offline tasks", f)
+	}
+	return doDelete(ctx, taskID)
+}
+
 // Rmdirs removes any empty directories (or directories only
 // containing empty directories) under f, including f.
 //

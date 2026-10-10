@@ -14,16 +14,18 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/readers"
 	"github.com/rclone/rclone/lib/rest"
 )
 
 // Object describes a FileLu object
 type Object struct {
-	fs      *Fs
-	remote  string
-	size    int64
-	modTime time.Time
+	fs       *Fs
+	remote   string
+	size     int64
+	modTime  time.Time
+	fileCode string // file code from the listing, if known
 }
 
 // NewObject creates a new Object for the given remote path
@@ -49,51 +51,76 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	returnedRemote := remote
 	return &Object{
-		fs:      f,
-		remote:  returnedRemote,
-		size:    size,
-		modTime: time.Now(),
+		fs:       f,
+		remote:   returnedRemote,
+		size:     size,
+		modTime:  time.Now(),
+		fileCode: fileCode,
 	}, nil
+}
+
+// linkLifetime is how long a direct link is used. FileLu states no
+// expiry for the links of /file/direct_link, so this is a conservative
+// estimate.
+const linkLifetime = 10 * time.Minute
+
+// linkKey returns the key of the object's direct link.
+func (o *Object) linkKey() string {
+	id := o.fileCode
+	if id == "" {
+		id = path.Join(o.fs.root, o.remote)
+	}
+	return linkcache.Key(o.fs.Name(), id, strconv.FormatInt(o.size, 10))
 }
 
 // Open opens the object for reading
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	filePath := path.Join(o.fs.root, o.remote)
-	// Get direct link
-	directLink, size, err := o.fs.getDirectLink(ctx, filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get direct link: %w", err)
+	fetch := func(ctx context.Context) (*linkcache.Link, error) {
+		directLink, size, err := o.fs.getDirectLink(ctx, filePath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get direct link: %w", err)
+		}
+		return &linkcache.Link{URL: directLink, Value: size}, nil
+	}
+	return linkcache.Default.Open(ctx, o.linkKey(), linkLifetime, fetch, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.download(ctx, link, options)
+	})
+}
+
+// download reads the range of options from the direct link.
+func (o *Object) download(ctx context.Context, link *linkcache.Link, options []fs.OpenOption) (io.ReadCloser, error) {
+	size := o.size
+	if linkSize, ok := link.Value.(int64); ok && linkSize > 0 {
+		size = linkSize
 	}
 
-	o.size = size
-
-	// Offset and Count for range download
+	// Offset and count of the range, for a server that ignores it
 	var offset int64
-	var count int64
-	fs.FixRangeOption(options, o.size)
+	count := int64(-1)
+	fs.FixRangeOption(options, size)
 	for _, option := range options {
 		switch x := option.(type) {
 		case *fs.RangeOption:
-			offset, count = x.Decode(o.size)
-			if count < 0 {
-				count = o.size - offset
-			}
+			offset, count = x.Decode(size)
 		case *fs.SeekOption:
 			offset = x.Offset
-			count = o.size
 		default:
 			if option.Mandatory() {
 				fs.Logf(o, "Unsupported mandatory option: %v", option)
 			}
 		}
 	}
+	headers := fs.OpenOptionHeaders(options)
 
-	// Wrap the response body to handle offset and count
 	var reader io.ReadCloser
-	err = o.fs.pacer.Call(func() (bool, error) {
-		req, err := http.NewRequestWithContext(ctx, "GET", directLink, nil)
+	err := o.fs.pacer.Call(func() (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", link.URL, nil)
 		if err != nil {
 			return false, fmt.Errorf("failed to create download request: %w", err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
 		}
 
 		resp, err := o.fs.client.Do(req)
@@ -101,46 +128,60 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			return shouldRetry(err), fmt.Errorf("failed to download file: %w", err)
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			defer func() {
-				if err := resp.Body.Close(); err != nil {
-					fs.Logf(nil, "Failed to close response body: %v", err)
-				}
-			}()
-			return false, fmt.Errorf("failed to download file: HTTP %d", resp.StatusCode)
-		}
-
-		if offset > 0 {
-			_, err = io.CopyN(io.Discard, resp.Body, offset)
-			if err != nil {
-				_ = resp.Body.Close()
-				return false, fmt.Errorf("failed to skip offset: %w", err)
-			}
-		}
-
-		if count > 0 {
-			reader = struct {
-				io.Reader
-				io.Closer
-			}{
-				Reader: io.LimitReader(resp.Body, count),
-				Closer: resp.Body,
-			}
-		} else {
+		switch resp.StatusCode {
+		case http.StatusPartialContent:
 			reader = resp.Body
+			return false, nil
+		case http.StatusOK:
+			// The server sent the whole file: skip to the offset
+			if offset > 0 {
+				_, err = io.CopyN(io.Discard, resp.Body, offset)
+				if err != nil {
+					_ = resp.Body.Close()
+					return shouldRetry(err), fmt.Errorf("failed to skip offset: %w", err)
+				}
+			}
+			if count >= 0 {
+				reader = readers.NewLimitedReadCloser(resp.Body, count)
+			} else {
+				reader = resp.Body
+			}
+			return false, nil
 		}
-
-		return false, nil
+		if err := resp.Body.Close(); err != nil {
+			fs.Logf(nil, "Failed to close response body: %v", err)
+		}
+		err = &statusError{status: resp.StatusCode}
+		return shouldRetry(err) || shouldRetryHTTP(resp.StatusCode), err
 	})
 	if err != nil {
 		return nil, err
 	}
-
 	return reader, nil
+}
+
+// statusError is the error of a download answered with an HTTP status
+// other than 200 or 206.
+type statusError struct {
+	status int
+}
+
+// Error returns the error's message.
+func (e *statusError) Error() string {
+	return fmt.Sprintf("failed to download file: HTTP %d", e.status)
+}
+
+// HTTPStatusCode returns the HTTP status of the response, so that a
+// refused direct link is recognised.
+func (e *statusError) HTTPStatusCode() int {
+	return e.status
 }
 
 // Update updates the object with new data
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
+	// The new content gets a new file code and link
+	linkcache.Default.Drop(o.linkKey(), nil)
+	o.fileCode = ""
 	size := src.Size()
 	counter := readers.NewCountingReader(in)
 	in = counter
@@ -169,6 +210,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 	o.size = size
 	o.modTime = src.ModTime(ctx)
+	linkcache.Default.Drop(o.linkKey(), nil)
 	return nil
 }
 

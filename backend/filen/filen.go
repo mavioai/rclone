@@ -167,6 +167,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	fileSystem.features = (&fs.Features{
+		FindByListing:           true, // NewObject lists the folders of the path
 		ReadMimeType:            true,
 		WriteMimeType:           true,
 		CanHaveEmptyDirectories: true,

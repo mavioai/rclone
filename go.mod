@@ -14,11 +14,13 @@ require (
 	github.com/FilenCloudDienste/filen-sdk-go v0.0.39
 	github.com/Files-com/files-sdk-go/v3 v3.3.194
 	github.com/Max-Sum/base32768 v0.0.0-20230304063302-18e6ce5945fd
+	github.com/SheltonZhu/115driver v1.3.5
 	github.com/a1ex3/zstd-seekable-format-go/pkg v0.10.0
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v1.1.2
 	github.com/abbot/go-http-auth v0.4.0
 	github.com/adrg/xdg v0.5.3
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/anacrolix/dms v1.7.2
 	github.com/anacrolix/log v0.17.0
 	github.com/apache/arrow-go/v18 v18.7.0 // indirect
@@ -39,6 +41,7 @@ require (
 	github.com/diskfs/go-diskfs v1.9.4
 	github.com/dop251/scsu v0.0.0-20220106150536-84ac88021d00
 	github.com/dropbox/dropbox-sdk-go-unofficial/v6 v6.4.0
+	github.com/foxxorcat/weiyun-sdk-go v1.1.0
 	github.com/gabriel-vasile/mimetype v1.4.13
 	github.com/gdamore/tcell/v2 v2.9.0
 	github.com/go-chi/chi/v5 v5.3.1
@@ -80,6 +83,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/rogpeppe/go-internal v1.15.0
 	github.com/shirou/gopsutil/v4 v4.26.6
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
@@ -108,6 +112,7 @@ require (
 	gopkg.in/validator.v2 v2.0.1
 	gopkg.in/yaml.v3 v3.0.1
 	moul.io/http2curl/v2 v2.3.0
+	resty.dev/v3 v3.0.0-beta.3
 	storj.io/uplink v1.14.3
 )
 
@@ -123,9 +128,11 @@ require (
 	github.com/ProtonMail/gopenpgp/v3 v3.4.1 // indirect
 	github.com/PuerkitoBio/goquery v1.12.0 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
+	github.com/aead/ecdh v0.2.0 // indirect
 	github.com/akavel/rsrc v0.10.2 // indirect
 	github.com/anacrolix/generics v0.2.0 // indirect
 	github.com/anchore/go-lzo v0.1.1 // indirect
+	github.com/andreburgaud/crypt2go v1.1.0 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/andybalholm/cascadia v1.3.4 // indirect
 	github.com/appscode/go-querystring v0.0.0-20170504095604-0126cfb3f1dc // indirect
@@ -198,6 +205,7 @@ require (
 	github.com/jcmturner/gofork v1.7.6 // indirect
 	github.com/jcmturner/goidentity/v6 v6.0.1 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
+	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/jtolio/noiseconn v0.0.0-20231127013910-f6d9ecbf1de7 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/klauspost/crc32 v1.3.0 // indirect
@@ -215,6 +223,8 @@ require (
 	github.com/minio/md5-simd v1.1.2 // indirect
 	github.com/minio/minlz v1.2.0 // indirect
 	github.com/minio/xxml v0.0.3 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nwaples/rardecode/v2 v2.2.5 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect

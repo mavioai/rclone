@@ -419,7 +419,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	f.features = (&fs.Features{
-		ReadMimeType: true,
+		FindByListing: true, // NewObject lists the album or month
+		ReadMimeType:  true,
 	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 

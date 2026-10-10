@@ -42,6 +42,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/env"
 	"github.com/rclone/rclone/lib/jwtutil"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
@@ -316,6 +317,7 @@ type Fs struct {
 	opt             Options               // parsed options
 	features        *fs.Features          // optional features
 	srv             *rest.Client          // the connection to the server
+	dlSrv           *rest.Client          // the connection to the download servers, without authentication
 	dirCache        *dircache.DirCache    // Map of directory path to directory id
 	pacer           *fs.Pacer             // pacer for API calls
 	tokenRenewer    *oauthutil.Renew      // renew the token on expiry
@@ -483,6 +485,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:            root,
 		opt:             *opt,
 		srv:             rest.NewClient(client).SetRoot(rootURL),
+		dlSrv:           rest.NewClient(fshttp.NewClient(ctx)),
 		pacer:           fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 		uploadToken:     pacer.NewTokenDispenser(ci.Transfers),
 		itemMetaCacheMu: new(sync.Mutex),
@@ -491,8 +494,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
+		// Estimates, not measurements
+		MaxFileStreams: 4,
+		MaxStreams:     16,
 	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
+	f.dlSrv.SetErrorHandler(errorHandler)
 
 	// If using an accessToken, set the Authorization header
 	if f.opt.AccessToken != "" {
@@ -1673,6 +1680,30 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return nil, errors.New("can't download - no id")
 	}
 	fs.FixRangeOption(options, o.size)
+	// The redirect's target is kept, so that the opens of one object
+	// share it instead of each asking the API for it
+	key := linkcache.Key(o.fs.Name(), o.id, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10), o.sha1)
+	in, err = linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		var resp *http.Response
+		opts := rest.Opts{
+			Method:  "GET",
+			RootURL: link.URL,
+			Options: options,
+		}
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = o.fs.dlSrv.Call(ctx, &opts)
+			return shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return resp.Body, nil
+	})
+	if !errors.Is(err, errNoRedirect) {
+		return in, err
+	}
+	// The API answered with the content itself
 	var resp *http.Response
 	opts := rest.Opts{
 		Method:  "GET",
@@ -1687,6 +1718,47 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return nil, err
 	}
 	return resp.Body, err
+}
+
+// linkLifetime is how long the target of a download redirect is kept:
+// Box states no lifetime for its download URLs, only that they are
+// temporary, and a refused one is requested again.
+const linkLifetime = 10 * time.Minute
+
+// errNoRedirect reports that the download API answered with the content
+// itself rather than with a redirect to it.
+var errNoRedirect = errors.New("download did not redirect")
+
+// downloadLink asks the download API for the URL it redirects to.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
+	var target *url.URL
+	opts := rest.Opts{
+		Method: "GET",
+		Path:   "/files/" + o.id + "/content",
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			target = req.URL
+			return http.ErrUseLastResponse
+		},
+	}
+	var resp *http.Response
+	err := o.fs.pacer.Call(func() (bool, error) {
+		target = nil
+		var err error
+		resp, err = o.fs.srv.Call(ctx, &opts)
+		if target != nil {
+			// It is the redirect we are expecting
+			return false, nil
+		}
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if target == nil {
+		_ = resp.Body.Close()
+		return nil, errNoRedirect
+	}
+	return &linkcache.Link{URL: target.String()}, nil
 }
 
 // upload does a single non-multipart upload

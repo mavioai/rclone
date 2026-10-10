@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,7 @@ import (
 	"github.com/rclone/rclone/lib/atexit"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
@@ -1150,6 +1152,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		WriteDirSetModTime:       true,
 		UserDirMetadata:          false,
 		DirModTimeUpdatesOnWrite: false,
+		// Estimates, not measurements
+		MaxFileStreams: 4,
+		MaxStreams:     16,
 	}).Fill(ctx, f)
 	f.srv.SetErrorHandler(errorHandler)
 
@@ -2424,13 +2429,134 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return o.openInfected(ctx, options...)
 	}
 	opts := o.fs.newOptsCall(o.id, "GET", "/content")
-	opts.Options = options
 	if o.fs.opt.AVOverride {
 		// SharePoint v2 (tenant_url) or non-flagged objects: keep legacy query.
 		opts.Parameters = url.Values{"AVOverride": {"1"}}
 	}
-	return o.openWithRedirect(ctx, &opts)
+	// The redirect's target is kept, so that the opens of one object
+	// share it instead of each asking the API for it
+	key := linkcache.Key(o.fs.Name(), o.id, o.hash, strconv.FormatInt(o.modTime.UnixNano(), 10))
+	in, err = linkcache.Default.Open(ctx, key, linkLifetime, func(ctx context.Context) (*linkcache.Link, error) {
+		return o.downloadLink(ctx, opts)
+	}, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.openLink(ctx, link, options)
+	})
+	if errors.Is(err, errNoRedirect) {
+		opts.Options = options
+		return o.openWithRedirect(ctx, &opts)
+	}
+	return in, err
 }
+
+// linkLifetime is how long the target of a download redirect is kept:
+// Graph says its pre-authenticated download URLs last a few minutes,
+// and a refused one is requested again.
+const linkLifetime = 5 * time.Minute
+
+// errNoRedirect reports that the download API answered with the content
+// itself rather than with a redirect to it.
+var errNoRedirect = errors.New("download did not redirect")
+
+// downloadLink asks the download API of opts for the pre-authenticated
+// URL it redirects to.
+func (o *Object) downloadLink(ctx context.Context, opts rest.Opts) (*linkcache.Link, error) {
+	var target *url.URL
+	opts.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		target = req.URL
+		return http.ErrUseLastResponse
+	}
+	var resp *http.Response
+	err := o.fs.pacer.Call(func() (bool, error) {
+		target = nil
+		var err error
+		resp, err = o.fs.srv.Call(ctx, &opts)
+		if target != nil {
+			// It is the redirect we are expecting
+			return false, nil
+		}
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		if resp != nil {
+			if virus := resp.Header.Get("X-Virus-Infected"); virus != "" {
+				err = malwareDownloadError(o.fs.opt.AVOverride, fmt.Errorf("%s: %w", virus, err))
+			}
+		}
+		return nil, err
+	}
+	if target == nil {
+		_ = resp.Body.Close()
+		return nil, errNoRedirect
+	}
+	link := &linkcache.Link{URL: target.String()}
+	if o.fs.opt.AVOverride {
+		// Append AVOverride without re-encoding tempauth (re-encoding breaks the signature).
+		if !strings.Contains(target.RawQuery, "AVOverride=") {
+			if target.RawQuery == "" {
+				link.URL += "?AVOverride=1"
+			} else {
+				link.URL += "&AVOverride=1"
+			}
+		}
+		// Some SharePoint endpoints honor it only on the final download request
+		link.Header = http.Header{"Prefer": {"forceInfectedDownload"}}
+	}
+	return link, nil
+}
+
+// openLink opens the pre-authenticated download URL of link, which
+// must not carry the Graph Authorization.
+func (o *Object) openLink(ctx context.Context, link *linkcache.Link, options []fs.OpenOption) (io.ReadCloser, error) {
+	var resp *http.Response
+	err := o.fs.pacer.Call(func() (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", link.URL, nil)
+		if err != nil {
+			return false, err
+		}
+		for k, v := range link.Header {
+			req.Header[k] = slices.Clone(v)
+		}
+		fs.OpenOptionAddHTTPHeaders(req.Header, options)
+		resp, err = o.fs.unAuth.Do(req)
+		if err != nil {
+			return shouldRetry(ctx, resp, err)
+		}
+		// unAuth.Do does not check status; treat non-2xx as failure so a malware
+		// JSON body is not written out as file content.
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			_ = resp.Body.Close()
+			err = &downloadError{
+				status: resp.StatusCode,
+				msg:    fmt.Sprintf("HTTP error %d (%s) %s", resp.StatusCode, resp.Status, strings.TrimSpace(string(body))),
+			}
+			if strings.Contains(string(body), "malwareDetected") || resp.Header.Get("X-Virus-Infected") != "" {
+				err = malwareDownloadError(o.fs.opt.AVOverride, err)
+			}
+		}
+		return shouldRetry(ctx, resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusOK && resp.ContentLength > 0 && resp.Header.Get("Content-Range") == "" {
+		// Overwrite size with actual size since size readings from Onedrive is unreliable.
+		o.size = resp.ContentLength
+	}
+	return resp.Body, nil
+}
+
+// downloadError is an error answer of a download URL.
+type downloadError struct {
+	status int
+	msg    string
+}
+
+// Error returns the message of e.
+func (e *downloadError) Error() string { return e.msg }
+
+// StatusCode returns the HTTP status of e.
+func (e *downloadError) StatusCode() int { return e.status }
 
 // malwareDetected reports whether metadata says this object is malware-flagged.
 func (o *Object) malwareDetected() bool {

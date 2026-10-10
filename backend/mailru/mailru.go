@@ -342,6 +342,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.pacer = fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleepPacer), pacer.MaxSleep(maxSleepPacer), pacer.DecayConstant(decayConstPacer)))
 
 	f.features = (&fs.Features{
+		MaxFileStreams:          4, // a download server serves 4 streams
+		MaxStreams:              4,
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
 		// Can copy/move across mailru configs (almost, thus true here), but

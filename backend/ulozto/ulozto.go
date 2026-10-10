@@ -28,6 +28,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
 )
@@ -795,6 +796,34 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) (err error) {
 
 // Open implements the mandatory method fs.Object.Open
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.ReadCloser, err error) {
+	key := linkcache.Key(o.fs.Name(), o.slug, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.remoteFsMtime.UnixNano(), 10))
+	return linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		opts := rest.Opts{
+			Method:  "GET",
+			RootURL: link.URL,
+			Options: options,
+		}
+
+		var httpResp *http.Response
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			httpResp, err = o.fs.rest.Call(ctx, &opts)
+			return o.fs.shouldRetry(ctx, httpResp, err, true)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return httpResp.Body, nil
+	})
+}
+
+// linkLifetime is how long a download link is used when Ulož.to states
+// no expiry in download_url_valid_until or download_url_validity_interval,
+// a conservative estimate.
+const linkLifetime = 10 * time.Minute
+
+// downloadLink requests the download link of the object.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/v5/file/download-link/vipdata",
@@ -808,7 +837,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.Read
 
 	var resp *api.GetDownloadLinkResponse
 
-	err = o.fs.pacer.Call(func() (bool, error) {
+	start := time.Now()
+	err := o.fs.pacer.Call(func() (bool, error) {
 		httpResp, err := o.fs.rest.CallJSON(ctx, &opts, &req, &resp)
 		return o.fs.shouldRetry(ctx, httpResp, err, true)
 	})
@@ -825,23 +855,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (rc io.Read
 		}
 		downloadURL += "hash=" + url.QueryEscape(resp.Hash)
 	}
-
-	opts = rest.Opts{
-		Method:  "GET",
-		RootURL: downloadURL,
-		Options: options,
+	link := &linkcache.Link{URL: downloadURL, Expires: resp.DownloadURLValidUntil}
+	if link.Expires.IsZero() && resp.DownloadURLValidityInterval > 0 {
+		link.Expires = start.Add(time.Duration(resp.DownloadURLValidityInterval) * time.Second)
 	}
-
-	var httpResp *http.Response
-
-	err = o.fs.pacer.Call(func() (bool, error) {
-		httpResp, err = o.fs.rest.Call(ctx, &opts)
-		return o.fs.shouldRetry(ctx, httpResp, err, true)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return httpResp.Body, err
+	return link, nil
 }
 
 func (o *Object) copyFrom(other *Object) {

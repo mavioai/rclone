@@ -28,6 +28,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/bucket"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
@@ -361,6 +362,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		ReadMetadata:  true,
 		WriteMetadata: true,
 		UserMetadata:  true,
+		FindByListing: true,
 	}).Fill(ctx, f)
 
 	f.srv = rest.NewClient(fshttp.NewClient(ctx))
@@ -775,15 +777,83 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		optionsFixed = append(optionsFixed, opt)
 	}
 
-	var resp *http.Response
-	// make a GET request to (frontend)/download/:item/:path
-	opts := rest.Opts{
-		Method:  "GET",
-		Path:    path.Join("/download/", o.fs.root, rest.URLPathEscapeAll(o.fs.opt.Enc.FromStandardPath(o.remote))),
-		Options: optionsFixed,
+	// The redirect's target, the item's storage node, is kept, so that
+	// the opens of one object share it instead of each asking for it
+	key := linkcache.Key(o.fs.Name(), path.Join(o.fs.root, o.remote), strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10), o.md5)
+	in, err = linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.openURL(ctx, link.URL, "", optionsFixed)
+	})
+	if errors.Is(err, errNoRedirect) {
+		// The frontend answered with the content itself
+		return o.openURL(ctx, "", o.downloadPath(), optionsFixed)
 	}
-	err = o.fs.pacer.Call(func() (bool, error) {
+	return in, err
+}
+
+// linkLifetime is how long the target of a download redirect is kept:
+// it names the storage node of the item, which changes only when the
+// item moves, and a refused one is requested again.
+const linkLifetime = time.Hour
+
+// errNoRedirect reports that the frontend answered with the content
+// itself rather than with a redirect to it.
+var errNoRedirect = errors.New("download did not redirect")
+
+// downloadPath returns the frontend's download path of the object:
+// /download/:item/:path.
+func (o *Object) downloadPath() string {
+	return path.Join("/download/", o.fs.root, rest.URLPathEscapeAll(o.fs.opt.Enc.FromStandardPath(o.remote)))
+}
+
+// downloadLink asks the frontend for the storage node URL its download
+// path redirects to.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
+	opts := rest.Opts{
+		Method:       "GET",
+		Path:         o.downloadPath(),
+		NoRedirect:   true,
+		IgnoreStatus: true,
+	}
+	var resp *http.Response
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
 		resp, err = o.fs.front.Call(ctx, &opts)
+		if err == nil && (resp.StatusCode < 200 || resp.StatusCode > 399) {
+			err = newDownloadError(resp)
+		}
+		return o.fs.shouldRetry(resp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	location, err := resp.Location()
+	_ = resp.Body.Close()
+	if errors.Is(err, http.ErrNoLocation) {
+		return nil, errNoRedirect
+	}
+	if err != nil {
+		return nil, fmt.Errorf("bad download redirect: %w", err)
+	}
+	return &linkcache.Link{URL: location.String()}, nil
+}
+
+// openURL opens the download URL rootURL+p, rootURL defaulting to the
+// frontend, with the options.
+func (o *Object) openURL(ctx context.Context, rootURL, p string, options []fs.OpenOption) (io.ReadCloser, error) {
+	opts := rest.Opts{
+		Method:       "GET",
+		RootURL:      rootURL,
+		Path:         p,
+		Options:      options,
+		IgnoreStatus: true,
+	}
+	var resp *http.Response
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
+		resp, err = o.fs.front.Call(ctx, &opts)
+		if err == nil && (resp.StatusCode < 200 || resp.StatusCode > 299) {
+			err = newDownloadError(resp)
+		}
 		return o.fs.shouldRetry(resp, err)
 	})
 	if err != nil {
@@ -791,6 +861,28 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 	return resp.Body, nil
 }
+
+// downloadError is an error answer of a download.
+type downloadError struct {
+	status int
+	msg    string
+}
+
+// newDownloadError reads and closes the error answer resp.
+func newDownloadError(resp *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	_ = resp.Body.Close()
+	return &downloadError{
+		status: resp.StatusCode,
+		msg:    fmt.Sprintf("HTTP error %v (%v) returned body: %q", resp.StatusCode, resp.Status, body),
+	}
+}
+
+// Error returns the message of e.
+func (e *downloadError) Error() string { return e.msg }
+
+// StatusCode returns the HTTP status of e.
+func (e *downloadError) StatusCode() int { return e.status }
 
 // Update the Object from in with modTime and size
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (err error) {

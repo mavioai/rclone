@@ -143,6 +143,7 @@ func NewFs(ctx context.Context, name string, root string, m configmap.Mapper) (f
 		CanHaveEmptyDirectories: true,
 		WriteMetadata:           false,
 		SlowHash:                true,
+		FindByListing:           true, // NewObject lists the parent directory
 	}).Fill(ctx, f)
 
 	rootContainer, rootDirectory := rootSplit(f.root)
@@ -253,10 +254,11 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		remote = strings.TrimPrefix(remote, "/")
 
 		obj := &Object{
-			fs:      f,
-			remote:  remote,
-			size:    file.Size,
-			modTime: time.Now(),
+			fs:       f,
+			remote:   remote,
+			size:     file.Size,
+			modTime:  time.Now(),
+			fileCode: file.FileCode,
 		}
 		entries = append(entries, obj)
 	}

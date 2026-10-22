@@ -268,11 +268,12 @@ func (w *pikpakChunkWriter) WriteChunk(ctx context.Context, chunkNumber int32, r
 			return false, err
 		}
 		res, err = w.client.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket:     w.mOut.Bucket,
-			Key:        w.mOut.Key,
-			UploadId:   w.mOut.UploadId,
-			PartNumber: &partNumber,
-			Body:       reader,
+			Bucket:        w.mOut.Bucket,
+			Key:           w.mOut.Key,
+			UploadId:      w.mOut.UploadId,
+			PartNumber:    &partNumber,
+			Body:          reader,
+			ContentLength: &currentChunkSize,
 		})
 		if err != nil {
 			if chunkNumber <= 8 {

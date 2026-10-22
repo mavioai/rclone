@@ -275,6 +275,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			}
 			// And remove the public link feature
 			f.features.PublicLink = nil
+			// Encrypted files are read from their start to reach an offset
+			f.features.SeekReadsFromStart = true
 
 			// renew the library password every 45 minutes
 			f.renew = NewRenew(45*time.Minute, func() error {

@@ -141,6 +141,82 @@ Set this flag to skip reading the modification time (can speed things up).
 
 Default Off.
 
+### --rc-serve-cache-duration=DURATION
+
+How long to keep the objects found when serving remote objects, so
+that consecutive requests for one file skip the backend's lookup. Set
+to 0 to look every object up on each request.
+
+`operations/list` and `operations/stat` always ask the backend and
+replace the cached objects they return, and the writes of the rc
+(`operations/*` and `sync/*`) drop the cached objects of the paths they
+touch.
+
+Backends that find an object by listing its directory (the
+`FindByListing` feature, such as pcloud, iclouddrive and most Chinese
+cloud drives) have the directory listed once on a lookup, and its
+objects kept, at most a quarter of `--rc-serve-cache-size` of them, so
+that the next requests for the files beside it need no lookup.
+Concurrent lookups in one directory share the listing.
+
+Each served object carries an `ETag` naming its version. A request
+with an `If-Match` naming another version looks the object up again
+and gets 412 if it still differs. When opening a cached object fails,
+the object is looked up again and the open retried once.
+
+The s3, azureblob, swift, webdav, oracleobjectstorage and qingstor
+backends read an object only in the version they found it with (by
+`If-Match` with the storage's ETag), and that ETag is part of the
+served version. A file replaced since it was found therefore fails
+with 412 instead of returning the new content under the old size.
+googlecloudstorage reads the generation found, and b2 the file ID
+unless `--b2-download-url` is set.
+
+Default 5m0s.
+
+### --rc-serve-cache-size=N
+
+Maximum number of objects kept when serving remote objects.
+
+Default 10000.
+
+### --rc-serve-poll-interval=DURATION
+
+While objects of a remote whose backend can notify changes (the
+backends supporting `--poll-interval` in `rclone mount`) are kept for
+serving, poll the backend for changes at this interval and drop the
+kept objects of the paths that changed, whichever root of the remote
+they were found through. Polling of a remote stops once none of its
+objects are kept. Set to 0 to disable.
+
+Default 1m0s.
+
+### --rc-serve-max-file-streams=N
+
+Maximum number of streams of one file open when serving remote
+objects. When a file has this many, opening another closes the one
+read least recently. 0 means the backend's default (the
+`MaxFileStreams` feature, set for the cloud drives that throttle
+concurrent downloads), and -1 no limit.
+
+Default 0.
+
+### --rc-serve-max-streams=N
+
+Maximum number of streams of one account open when serving remote
+objects. The account is the innermost remote beneath wrappers such as
+crypt. When it has this many, opening another waits for one to close.
+0 means the backend's default (the `MaxStreams` feature), and -1 no
+limit.
+
+Default 0.
+
+Failures of serving remote objects are answered with the status of
+the storage's error: 404 for objects not found, 412 for changed
+versions, 403 for refusals, 429 for quotas and rate limits, 503 for
+unavailable storage (both with `Retry-After` when the storage gave
+one), and 502 for other errors.
+
 ### --rc-files /path/to/directory
 
 Path to local files to serve on the HTTP server.

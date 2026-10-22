@@ -16,6 +16,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -377,4 +378,117 @@ func TestNotFoundInMultistatus(t *testing.T) {
 
 	_, err = f.List(ctx, "missing")
 	assert.Equal(t, fs.ErrorDirNotFound, err)
+}
+
+// TestOpenIfMatch checks that reads are conditional on the strong
+// entity tag that PROPFIND found.
+func TestOpenIfMatch(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		propETag   = `"v1"`
+		current    = `"v1"`
+		gotIfMatch []string
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case "PROPFIND":
+			w.WriteHeader(http.StatusMultiStatus)
+			_, _ = fmt.Fprintf(w, `<d:multistatus xmlns:d="DAV:">
+<d:response>
+ <d:href>/file.txt</d:href>
+ <d:propstat>
+  <d:prop>
+   <d:getcontentlength>10</d:getcontentlength>
+   <d:resourcetype/>
+   <d:getetag>%s</d:getetag>
+  </d:prop>
+  <d:status>HTTP/1.1 200 OK</d:status>
+ </d:propstat>
+</d:response>
+</d:multistatus>`, propETag)
+		case http.MethodGet:
+			ifMatch := r.Header.Get("If-Match")
+			gotIfMatch = append(gotIfMatch, ifMatch)
+			if ifMatch != "" && ifMatch != current {
+				w.WriteHeader(http.StatusPreconditionFailed)
+				return
+			}
+			_, _ = fmt.Fprint(w, "0123456789")
+		}
+	}))
+	defer ts.Close()
+	configfile.Install()
+	ctx := context.Background()
+	f, err := webdav.NewFs(ctx, remoteName, "", configmap.Simple{"type": "webdav", "url": ts.URL})
+	require.NoError(t, err)
+	read := func(o fs.Object) error {
+		fd, err := o.Open(ctx)
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(io.Discard, fd)
+		return fd.Close()
+	}
+
+	o, err := f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	require.NoError(t, read(o))
+
+	mu.Lock()
+	current = `"v2"`
+	mu.Unlock()
+	err = read(o)
+	require.Error(t, err)
+	status, _ := serve.ErrorStatus(err)
+	assert.Equal(t, http.StatusPreconditionFailed, status)
+
+	// Weak entity tags can't be compared by If-Match, so aren't sent
+	mu.Lock()
+	propETag = `W/"v2"`
+	mu.Unlock()
+	o, err = f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	require.NoError(t, read(o))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{`"v1"`, `"v1"`, ""}, gotIfMatch)
+}
+
+// TestOpenRangeIgnored checks that a range is read right from a server
+// that ignores it and sends the whole file.
+func TestOpenRangeIgnored(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "PROPFIND":
+			w.WriteHeader(http.StatusMultiStatus)
+			_, _ = fmt.Fprint(w, fileInfoResponse)
+		case http.MethodGet:
+			_, _ = fmt.Fprint(w, "0123456789")
+		}
+	}))
+	defer ts.Close()
+	configfile.Install()
+	ctx := context.Background()
+	f, err := webdav.NewFs(ctx, remoteName, "", configmap.Simple{"type": "webdav", "url": ts.URL})
+	require.NoError(t, err)
+	o, err := f.NewObject(ctx, "file.txt")
+	require.NoError(t, err)
+	for _, test := range []struct {
+		option fs.OpenOption
+		want   string
+	}{
+		{&fs.RangeOption{Start: 2, End: 4}, "234"},
+		{&fs.SeekOption{Offset: 7}, "789"},
+		{&fs.RangeOption{Start: -1, End: 3}, "789"},
+	} {
+		fd, err := o.Open(ctx, test.option)
+		require.NoError(t, err)
+		data, err := io.ReadAll(fd)
+		require.NoError(t, err)
+		require.NoError(t, fd.Close())
+		assert.Equal(t, test.want, string(data), test.option.String())
+	}
 }

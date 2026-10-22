@@ -208,6 +208,7 @@ func NewFs(ctx context.Context, name string, root string, config configmap.Mappe
 	}
 
 	f.features = (&fs.Features{
+		FindByListing:           true, // NewObject lists the parent folder
 		DuplicateFiles:          true,
 		CanHaveEmptyDirectories: true,
 		ReadMimeType:            true,

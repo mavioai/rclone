@@ -40,6 +40,10 @@ type Features struct {
 	Overlay                  bool // this wraps one or more backends to add functionality
 	ChunkWriterDoesntSeek    bool // set if the chunk writer doesn't need to read the data more than once
 	DoubleSlash              bool // set if backend supports double slashes in paths
+	SeekReadsFromStart       bool // set if reaching an offset of an object reads it from the start
+	FindByListing            bool // set if NewObject lists the parent directory to find the object
+	MaxFileStreams           int  // streams of one object the storage serves well at once, 0 if unknown
+	MaxStreams               int  // streams of one account the storage serves well at once, 0 if unknown
 
 	// Purge all files in the directory specified
 	//
@@ -208,6 +212,25 @@ type Features struct {
 	// otherwise it will be JSON encoded and shown to the user like that
 	Command func(ctx context.Context, name string, arg []string, opt map[string]string) (any, error)
 
+	// Link hard links src to remote within the same storage, so that
+	// both names share the object's data.
+	//
+	// It returns the destination Object and a possible error.
+	//
+	// If it isn't possible then return fs.ErrorCantLink
+	Link func(ctx context.Context, src Object, remote string) (Object, error)
+
+	// AddURL adds a remote URL to be downloaded server-side
+	AddURL func(ctx context.Context, url string, opt map[string]string) (*OfflineTask, error)
+
+	// ListOfflineTasks returns server-side offline download tasks.
+	// Tasks added before since may be left out; the zero time lists
+	// every task.
+	ListOfflineTasks func(ctx context.Context, since time.Time) ([]*OfflineTask, error)
+
+	// DeleteOfflineTask deletes a server-side offline download task
+	DeleteOfflineTask func(ctx context.Context, taskID string) error
+
 	// Shutdown the backend, closing any background tasks and any
 	// cached connections.
 	Shutdown func(ctx context.Context) error
@@ -363,6 +386,14 @@ func (ft *Features) Fill(ctx context.Context, f Fs) *Features {
 	if do, ok := f.(Commander); ok {
 		ft.Command = do.Command
 	}
+	if do, ok := f.(Linker); ok {
+		ft.Link = do.Link
+	}
+	if do, ok := f.(OfflineDownloader); ok {
+		ft.AddURL = do.AddURL
+		ft.ListOfflineTasks = do.ListOfflineTasks
+		ft.DeleteOfflineTask = do.DeleteOfflineTask
+	}
 	if do, ok := f.(Shutdowner); ok {
 		ft.Shutdown = do.Shutdown
 	}
@@ -404,6 +435,11 @@ func (ft *Features) Mask(ctx context.Context, f Fs) *Features {
 	// ft.Overlay = ft.Overlay && mask.Overlay don't propagate Overlay
 	ft.ChunkWriterDoesntSeek = ft.ChunkWriterDoesntSeek && mask.ChunkWriterDoesntSeek
 	ft.DoubleSlash = ft.DoubleSlash && mask.DoubleSlash
+	// A wrapper reads from the start when what it wraps does
+	ft.SeekReadsFromStart = ft.SeekReadsFromStart || mask.SeekReadsFromStart
+	// A wrapper finds an object by listing when what it wraps does
+	ft.FindByListing = ft.FindByListing || mask.FindByListing
+	// The stream limits belong to the storage, found by unwrapping
 
 	if mask.Purge == nil {
 		ft.Purge = nil
@@ -472,6 +508,18 @@ func (ft *Features) Mask(ctx context.Context, f Fs) *Features {
 		ft.Disconnect = nil
 	}
 	// Command is always local so we don't mask it
+	if mask.Link == nil {
+		ft.Link = nil
+	}
+	if mask.AddURL == nil {
+		ft.AddURL = nil
+	}
+	if mask.ListOfflineTasks == nil {
+		ft.ListOfflineTasks = nil
+	}
+	if mask.DeleteOfflineTask == nil {
+		ft.DeleteOfflineTask = nil
+	}
 	if mask.Shutdown == nil {
 		ft.Shutdown = nil
 	}
@@ -801,6 +849,74 @@ type Commander interface {
 	// If it is a string or a []string it will be shown to the user
 	// otherwise it will be JSON encoded and shown to the user like that
 	Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error)
+}
+
+// OfflineTaskStatus represents the state of an offline download task
+type OfflineTaskStatus string
+
+// Offline task status constants
+const (
+	OfflineTaskStatusInit     OfflineTaskStatus = "init"
+	OfflineTaskStatusRunning  OfflineTaskStatus = "running"
+	OfflineTaskStatusComplete OfflineTaskStatus = "complete"
+	OfflineTaskStatusError    OfflineTaskStatus = "error"
+)
+
+// OfflineTask describes a server-side offline download task
+type OfflineTask struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	URL       string            `json:"url"`
+	Size      int64             `json:"size"`
+	Status    OfflineTaskStatus `json:"status"`
+	Progress  float64           `json:"progress"` // percentage 0.0 - 100.0
+	Speed     int64             `json:"speed,omitempty"`
+	ErrorMsg  string            `json:"error_msg,omitempty"`
+	CreatedAt time.Time         `json:"created_at,omitempty"`
+}
+
+// OfflinePageBefore reports whether every task in a page of a drive's
+// offline tasks, which drives list newest first, was added before
+// since, so that listing them can stop. added returns when a task was
+// added; a page holding a task added at an unknown time doesn't stop
+// the listing, nor does the zero since.
+func OfflinePageBefore[T any](page []T, since time.Time, added func(T) time.Time) bool {
+	if since.IsZero() || len(page) == 0 {
+		return false
+	}
+	for _, t := range page {
+		a := added(t)
+		if a.IsZero() || !a.Before(since) {
+			return false
+		}
+	}
+	return true
+}
+
+// offlineTaskAdded returns when an offline task was added
+func offlineTaskAdded(t *OfflineTask) time.Time { return t.CreatedAt }
+
+// OfflineTasksBefore is OfflinePageBefore for a page of OfflineTasks.
+func OfflineTasksBefore(page []*OfflineTask, since time.Time) bool {
+	return OfflinePageBefore(page, since, offlineTaskAdded)
+}
+
+// Linker is an optional interface for Fs
+type Linker interface {
+	// Link hard links src to remote within the same storage, so that
+	// both names share the object's data.
+	//
+	// It returns the destination Object and a possible error.
+	//
+	// If it isn't possible then return fs.ErrorCantLink
+	Link(ctx context.Context, src Object, remote string) (Object, error)
+}
+
+// OfflineDownloader is an optional interface for Fs to support cloud-side offline download
+type OfflineDownloader interface {
+	AddURL(ctx context.Context, url string, opt map[string]string) (*OfflineTask, error)
+	ListOfflineTasks(ctx context.Context, since time.Time) ([]*OfflineTask, error)
+	DeleteOfflineTask(ctx context.Context, taskID string) error
 }
 
 // Shutdowner is an interface to wrap the Shutdown function

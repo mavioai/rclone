@@ -128,4 +128,44 @@ func (f *Fs) InternalTest(t *testing.T) {
 	t.Run("ObjectInfo", func(t *testing.T) { testObjectInfo(t, f, false) })
 	t.Run("ObjectInfoWrap", func(t *testing.T) { testObjectInfo(t, f, true) })
 	t.Run("ComputeHash", func(t *testing.T) { testComputeHash(t, f) })
+	t.Run("SeekKnownNonce", func(t *testing.T) { testSeekKnownNonce(t, f) })
+}
+
+// countingObject counts the opens of an object
+type countingObject struct {
+	fs.Object
+	opens int
+}
+
+func (o *countingObject) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	o.opens++
+	return o.Object.Open(ctx, options...)
+}
+
+// Test that a seek reads the file's header only the first time
+func testSeekKnownNonce(t *testing.T, f *Fs) {
+	if f.opt.NoDataEncryption {
+		t.Skip("no data encryption")
+	}
+	ctx := context.Background()
+	contents := random.String(3*blockDataSize + 100)
+	obj := uploadFile(t, f, "seek-nonce.bin", contents)
+	o := obj.(*Object)
+	inner := &countingObject{Object: o.Object}
+	o.Object = inner
+	read := func(offset, limit int64) string {
+		rc, err := o.Open(ctx, &fs.RangeOption{Start: offset, End: offset + limit - 1})
+		require.NoError(t, err)
+		data, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+		return string(data)
+	}
+	assert.Equal(t, contents[100:200], read(100, 100))
+	assert.GreaterOrEqual(t, inner.opens, 1)
+	for _, offset := range []int64{blockDataSize + 7, 3 * blockDataSize, 1} {
+		inner.opens = 0
+		assert.Equal(t, contents[offset:offset+50], read(offset, 50))
+		assert.Equal(t, 1, inner.opens, "opens of a seek to %d", offset)
+	}
 }

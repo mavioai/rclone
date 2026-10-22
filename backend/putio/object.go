@@ -2,6 +2,7 @@ package putio
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/linkcache"
 )
 
 // Object describes a Putio object
@@ -220,18 +222,36 @@ func (o *Object) Storable() bool {
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	// defer log.Trace(o, "")("err=%v", &err)
+	key := linkcache.Key(o.fs.Name(), strconv.FormatInt(o.file.ID, 10), strconv.FormatInt(o.file.Size, 10), o.file.CRC32)
+	return linkcache.Default.Open(ctx, key, linkLifetime, o.downloadLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.openLink(ctx, link.URL, options)
+	})
+}
+
+// linkLifetime is how long a download link is used. put.io states no
+// expiry for the links of /files/{id}/url, so this is a conservative
+// estimate.
+const linkLifetime = 10 * time.Minute
+
+// downloadLink requests the download link of the object.
+func (o *Object) downloadLink(ctx context.Context) (*linkcache.Link, error) {
 	var storageURL string
-	err = o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
 		storageURL, err = o.fs.client.Files.URL(ctx, o.file.ID, true)
 		return shouldRetry(ctx, err)
 	})
 	if err != nil {
-		return
+		return nil, err
 	}
+	return &linkcache.Link{URL: storageURL}, nil
+}
 
+// openLink opens the download link storageURL with the headers of options.
+func (o *Object) openLink(ctx context.Context, storageURL string, options []fs.OpenOption) (io.ReadCloser, error) {
 	var resp *http.Response
 	headers := fs.OpenOptionHeaders(options)
-	err = o.fs.pacer.Call(func() (bool, error) {
+	err := o.fs.pacer.Call(func() (bool, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, storageURL, nil)
 		if err != nil {
 			return shouldRetry(ctx, err)
@@ -248,12 +268,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			return shouldRetry(ctx, err)
 		}
 		if err := checkStatusCode(resp, 200, 206); err != nil {
+			_ = resp.Body.Close()
 			return shouldRetry(ctx, err)
 		}
 		return false, nil
 	})
-	if perr, ok := err.(*putio.ErrorResponse); ok && perr.Response.StatusCode >= 400 && perr.Response.StatusCode <= 499 {
-		_ = resp.Body.Close()
+	var serr *statusCodeError
+	if errors.As(err, &serr) && serr.response.StatusCode >= 400 && serr.response.StatusCode <= 499 {
 		return nil, fserrors.NoRetryError(err)
 	}
 	if err != nil {

@@ -1522,6 +1522,60 @@ func PublicLink(ctx context.Context, f fs.Fs, remote string, expire fs.Duration,
 	return doPublicLink(ctx, remote, expire, unlink)
 }
 
+// Link hard links srcRemote of fsrc to dstRemote of fdst, which must be
+// the same remote: both names then share the file's data. It returns
+// fs.ErrorCantLink when the remote cannot link the file, such as across
+// volumes.
+func Link(ctx context.Context, fdst, fsrc fs.Fs, dstRemote, srcRemote string) error {
+	doLink := fdst.Features().Link
+	if doLink == nil || fdst.Name() != fsrc.Name() {
+		return fs.ErrorCantLink
+	}
+	if SkipDestructive(ctx, srcRemote, "hard link") {
+		return nil
+	}
+	src, err := fsrc.NewObject(ctx, srcRemote)
+	if err != nil {
+		return err
+	}
+	if _, err := fdst.NewObject(ctx, dstRemote); err == nil {
+		return fmt.Errorf("hard link: %q already exists", dstRemote)
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+	_, err = doLink(ctx, src, dstRemote)
+	return err
+}
+
+// AddURL submits a remote URL to be downloaded server-side.
+func AddURL(ctx context.Context, f fs.Fs, url string, opt map[string]string) (*fs.OfflineTask, error) {
+	doAddURL := f.Features().AddURL
+	if doAddURL == nil {
+		return nil, fmt.Errorf("%v doesn't support offline downloads", f)
+	}
+	return doAddURL(ctx, url, opt)
+}
+
+// ListOfflineTasks retrieves the list of server-side offline download
+// tasks. Tasks added before since may be left out; the zero time lists
+// every task.
+func ListOfflineTasks(ctx context.Context, f fs.Fs, since time.Time) ([]*fs.OfflineTask, error) {
+	doList := f.Features().ListOfflineTasks
+	if doList == nil {
+		return nil, fmt.Errorf("%v doesn't support listing offline tasks", f)
+	}
+	return doList(ctx, since)
+}
+
+// DeleteOfflineTask deletes a server-side offline download task.
+func DeleteOfflineTask(ctx context.Context, f fs.Fs, taskID string) error {
+	doDelete := f.Features().DeleteOfflineTask
+	if doDelete == nil {
+		return fmt.Errorf("%v doesn't support deleting offline tasks", f)
+	}
+	return doDelete(ctx, taskID)
+}
+
 // Rmdirs removes any empty directories (or directories only
 // containing empty directories) under f, including f.
 //

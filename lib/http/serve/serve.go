@@ -2,6 +2,7 @@
 package serve
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,16 @@ import (
 
 // Object serves an fs.Object via HEAD or GET
 func Object(w http.ResponseWriter, r *http.Request, o fs.Object) {
+	ObjectWith(w, r, o, o.Open)
+}
+
+// OpenFunc opens an object for reading.
+type OpenFunc func(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error)
+
+// ObjectWith serves o like Object, reading it through open.
+//
+// A failed open is answered with the status of its error (ErrorStatus).
+func ObjectWith(w http.ResponseWriter, r *http.Request, o fs.Object, open OpenFunc) {
 	if r.Method != "HEAD" && r.Method != "GET" {
 		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
@@ -93,10 +104,12 @@ func Object(w http.ResponseWriter, r *http.Request, o fs.Object) {
 	}
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 
-	file, err := o.Open(r.Context(), options...)
+	file, err := open(r.Context(), options...)
 	if err != nil {
 		fs.Debugf(o, "Get request open error: %v", err)
-		http.Error(w, http.StatusText(http.StatusNotFound), http.StatusNotFound)
+		w.Header().Del("Content-Length")
+		w.Header().Del("Content-Range")
+		WriteError(w, err)
 		return
 	}
 	tr := accounting.Stats(r.Context()).NewTransfer(o, nil)

@@ -555,10 +555,12 @@ func (f *Fs) getDownloadLink(ctx context.Context, libraryID, filePath string) (s
 	}
 	filePath = path.Join("/", filePath)
 
+	// reuse=1 makes a link that can be used more than once in an hour,
+	// instead of once
 	opts := rest.Opts{
 		Method:     "GET",
 		Path:       APIv20 + libraryID + "/file/",
-		Parameters: url.Values{"p": {f.opt.Enc.FromStandardPath(filePath)}},
+		Parameters: url.Values{"p": {f.opt.Enc.FromStandardPath(filePath)}, "reuse": {"1"}},
 	}
 	result := ""
 	var resp *http.Response
@@ -625,8 +627,10 @@ func (f *Fs) download(ctx context.Context, downloadLink string, size int64, opti
 	})
 	if err != nil {
 		if resp != nil {
+			// Keep the status, so that a refused download link is recognised
+			err = &statusError{err: err, status: resp.StatusCode}
 			if resp.StatusCode == 404 {
-				return nil, fmt.Errorf("file not found '%s'", downloadLink)
+				return nil, fmt.Errorf("file not found '%s': %w", downloadLink, err)
 			}
 		}
 		return nil, err
@@ -1015,3 +1019,19 @@ func (f *Fs) getDirectoryEntriesAPIv2(ctx context.Context, libraryID, dirPath st
 	}
 	return result, nil
 }
+
+// statusError is an error of a response with the response's HTTP
+// status.
+type statusError struct {
+	err    error
+	status int
+}
+
+// Error returns the error's message.
+func (e *statusError) Error() string { return e.err.Error() }
+
+// Unwrap returns the error the response gave.
+func (e *statusError) Unwrap() error { return e.err }
+
+// HTTPStatusCode returns the HTTP status of the response.
+func (e *statusError) HTTPStatusCode() int { return e.status }

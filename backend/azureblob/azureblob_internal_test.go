@@ -9,18 +9,26 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/rclone/rclone/lib/http/serve"
+	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -99,6 +107,77 @@ func TestDecodeMetaDataFromDownloadResponse(t *testing.T) {
 		require.NoError(t, o.decodeMetaDataFromDownloadResponse(&info))
 		assert.Equal(t, int64(-1), o.size)
 	})
+}
+
+func TestOpenIfMatch(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		current    = `"0x8D1"`
+		gotIfMatch []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		ifMatch := r.Header.Get("If-Match")
+		gotIfMatch = append(gotIfMatch, ifMatch)
+		w.Header().Set("x-ms-version", "2023-11-03")
+		if ifMatch != "" && ifMatch != current {
+			w.Header().Set("x-ms-error-code", "ConditionNotMet")
+			w.WriteHeader(http.StatusPreconditionFailed)
+			return
+		}
+		w.Header().Set("ETag", current)
+		w.Header().Set("Content-Length", "5")
+		w.Header().Set("Last-Modified", time.Unix(1000, 0).UTC().Format(http.TimeFormat))
+		_, _ = io.WriteString(w, "hello")
+	}))
+	defer srv.Close()
+
+	ctx := context.Background()
+	svc, err := service.NewClientWithNoCredential(srv.URL+"/", nil)
+	require.NoError(t, err)
+	f := &Fs{
+		svc:         svc,
+		cntSVCcache: map[string]*container.Client{},
+		pacer:       fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep))),
+	}
+	f.setRoot("container")
+	read := func(o *Object) error {
+		in, err := o.Open(ctx)
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(io.Discard, in)
+		return in.Close()
+	}
+	listed := func(etag string) *Object {
+		size := int64(5)
+		e := azcore.ETag(etag)
+		o, err := f.newObjectWithInfo(ctx, "file", &container.BlobItem{
+			Properties: &container.BlobProperties{ContentLength: &size, ETag: &e},
+		})
+		require.NoError(t, err)
+		return o.(*Object)
+	}
+
+	// Listings give the ETag without quotes
+	o := listed("0x8D1")
+	require.NoError(t, read(o))
+
+	mu.Lock()
+	current = `"0x8D2"`
+	mu.Unlock()
+	err = read(o)
+	require.Error(t, err)
+	status, _ := serve.ErrorStatus(err)
+	assert.Equal(t, http.StatusPreconditionFailed, status)
+
+	// An object without an ETag reads unconditionally
+	require.NoError(t, read(listed("")))
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{`"0x8D1"`, `"0x8D1"`, ""}, gotIfMatch)
 }
 
 func TestCopySASTimingConstants(t *testing.T) {

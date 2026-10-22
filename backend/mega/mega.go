@@ -23,6 +23,7 @@ import (
 	"io"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,7 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/readers"
 	mega "github.com/t3rm1n4l/go-mega"
@@ -243,6 +245,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features = (&fs.Features{
 		DuplicateFiles:          true,
 		CanHaveEmptyDirectories: true,
+		// Estimates, not measurements
+		MaxFileStreams: 2,
+		MaxStreams:     6,
 	}).Fill(ctx, f)
 
 	// cache *mega.Mega on username so we can reuse and share
@@ -1057,7 +1062,9 @@ type openObject struct {
 	ctx    context.Context
 	mu     sync.Mutex
 	o      *Object
-	d      *mega.Download
+	key    string          // the key of the download's link
+	link   *linkcache.Link // the link of d
+	d      *download
 	id     int
 	skip   int64
 	chunk  []byte
@@ -1066,14 +1073,28 @@ type openObject struct {
 
 // get the next chunk
 func (oo *openObject) getChunk(ctx context.Context) (err error) {
-	if oo.id >= oo.d.Chunks() {
+	if oo.id >= oo.d.d.Chunks() {
 		return io.EOF
 	}
 	var chunk []byte
 	err = oo.o.fs.pacer.Call(func() (bool, error) {
-		chunk, err = oo.d.DownloadChunk(oo.id)
+		chunk, err = oo.d.chunk(oo.id)
 		return shouldRetry(ctx, err)
 	})
+	if err != nil && chunkRefused(err) && ctx.Err() == nil {
+		// The download URL is refused: request another
+		fs.Debugf(oo.o, "Download URL refused, requesting another: %v", err)
+		linkcache.Default.Drop(oo.key, oo.link)
+		link, linkErr := linkcache.Default.Get(ctx, oo.key, linkLifetime, oo.o.newDownload)
+		if linkErr != nil {
+			return fmt.Errorf("%w; requesting another download URL failed: %v", err, linkErr)
+		}
+		oo.link, oo.d = link, link.Value.(*download)
+		err = oo.o.fs.pacer.Call(func() (bool, error) {
+			chunk, err = oo.d.chunk(oo.id)
+			return shouldRetry(ctx, err)
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -1091,7 +1112,7 @@ func (oo *openObject) Read(p []byte) (n int, err error) {
 	}
 	// Skip data at the start if requested
 	for oo.skip > 0 {
-		_, size, err := oo.d.ChunkLocation(oo.id)
+		_, size, err := oo.d.d.ChunkLocation(oo.id)
 		if err != nil {
 			return 0, err
 		}
@@ -1124,7 +1145,7 @@ func (oo *openObject) Close() (err error) {
 		return nil
 	}
 	err = oo.o.fs.pacer.Call(func() (bool, error) {
-		err = oo.d.Finish()
+		err = oo.d.finish()
 		return shouldRetry(oo.ctx, err)
 	})
 	if err != nil {
@@ -1132,6 +1153,89 @@ func (oo *openObject) Close() (err error) {
 	}
 	oo.closed = true
 	return nil
+}
+
+// linkLifetime is how long the download URL of the g command is kept:
+// mega does not say how long they last, and a refused one is requested
+// again.
+const linkLifetime = 10 * time.Minute
+
+// download is a mega download, made by the g command, that the opens of
+// an object share. Its chunks can be downloaded concurrently. Its MAC
+// is checked once all of its chunks have been downloaded, once, as
+// mega.Download.Finish can be called only once.
+type download struct {
+	d       *mega.Download
+	mu      sync.RWMutex // read locked to download a chunk, write locked to finish
+	doneMu  sync.Mutex   // protects the following
+	done    []bool       // the chunks downloaded
+	left    int          // the number of chunks not downloaded
+	checked bool         // whether the MAC has been checked
+	macErr  error        // the error of checking the MAC
+}
+
+// newDownload makes the download of the object with the g command,
+// and keeps it as the Value of a link.
+func (o *Object) newDownload(ctx context.Context) (*linkcache.Link, error) {
+	var d *mega.Download
+	err := o.fs.pacer.Call(func() (bool, error) {
+		var err error
+		d, err = o.fs.srv.NewDownload(o.info)
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open download file failed: %w", err)
+	}
+	n := d.Chunks()
+	// The SDK hides the URL, so the link has none
+	return &linkcache.Link{Value: &download{d: d, done: make([]bool, n), left: n}}, nil
+}
+
+// chunk downloads and decrypts the chunk id.
+func (d *download) chunk(id int) ([]byte, error) {
+	d.mu.RLock()
+	chunk, err := d.d.DownloadChunk(id)
+	d.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	d.doneMu.Lock()
+	if !d.done[id] {
+		d.done[id] = true
+		d.left--
+	}
+	d.doneMu.Unlock()
+	return chunk, nil
+}
+
+// finish checks the MAC of the file if all of its chunks have been
+// downloaded.
+func (d *download) finish() error {
+	d.doneMu.Lock()
+	complete := d.left == 0
+	d.doneMu.Unlock()
+	if !complete {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.checked {
+		d.macErr = d.d.Finish()
+		d.checked = true
+	}
+	return d.macErr
+}
+
+// chunkRefused reports whether err says the download server refused
+// the download URL of a chunk.
+func chunkRefused(err error) bool {
+	msg := err.Error()
+	for _, status := range []string{"401", "403", "404", "410"} {
+		if strings.HasPrefix(msg, "Http Status: "+status) {
+			return true
+		}
+	}
+	return false
 }
 
 // Open an object for read
@@ -1150,19 +1254,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		}
 	}
 
-	var d *mega.Download
-	err = o.fs.pacer.Call(func() (bool, error) {
-		d, err = o.fs.srv.NewDownload(o.info)
-		return shouldRetry(ctx, err)
-	})
+	// The download is kept, so that the opens of one object share it
+	// instead of each sending the g command
+	key := linkcache.Key(o.fs.Name(), o.info.GetHash(), strconv.FormatInt(o.info.GetSize(), 10), strconv.FormatInt(o.info.GetTimeStamp().UnixNano(), 10))
+	link, err := linkcache.Default.Get(ctx, key, linkLifetime, o.newDownload)
 	if err != nil {
-		return nil, fmt.Errorf("open download file failed: %w", err)
+		return nil, err
 	}
 
 	oo := &openObject{
 		ctx:  ctx,
 		o:    o,
-		d:    d,
+		key:  key,
+		link: link,
+		d:    link.Value.(*download),
 		skip: offset,
 	}
 

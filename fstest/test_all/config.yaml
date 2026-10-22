@@ -704,3 +704,27 @@ backends:
    fastlist: false
    extratime: 2.0
    listretries: 5
+ - backend:  "aliyundrive"
+   remote:   "TestAliyunDrive:"
+   fastlist: false
+ - backend:  "baidunetdisk"
+   remote:   "TestBaiduNetdisk:"
+   fastlist: false
+ - backend:  "cloud115"
+   remote:   "TestCloud115:"
+   fastlist: false
+ - backend:  "cloud123"
+   remote:   "TestCloud123:"
+   fastlist: false
+ - backend:  "guangyadrive"
+   remote:   "TestGuangyaDrive:"
+   fastlist: false
+ - backend:  "quark"
+   remote:   "TestQuark:"
+   fastlist: false
+ - backend:  "thunder"
+   remote:   "TestThunder:"
+   fastlist: false
+ - backend:  "weiyun"
+   remote:   "TestWeiyun:"
+   fastlist: false

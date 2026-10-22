@@ -11,11 +11,13 @@ import (
 	"net/url"
 	"path"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	files_sdk "github.com/Files-com/files-sdk-go/v3"
 	"github.com/Files-com/files-sdk-go/v3/bundle"
+	"github.com/Files-com/files-sdk-go/v3/downloadurl"
 	"github.com/Files-com/files-sdk-go/v3/file"
 	file_migration "github.com/Files-com/files-sdk-go/v3/filemigration"
 	"github.com/Files-com/files-sdk-go/v3/folder"
@@ -30,6 +32,7 @@ import (
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/pacer"
 )
 
@@ -803,6 +806,7 @@ func (o *Object) Storable() bool {
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
 	// Offset and Count for range download
 	var offset, count int64
+	ranged := false
 	fs.FixRangeOption(options, o.size)
 	for _, option := range options {
 		switch x := option.(type) {
@@ -811,9 +815,11 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			if count < 0 {
 				count = o.size - offset
 			}
+			ranged = true
 		case *fs.SeekOption:
 			offset = x.Offset
 			count = o.size - offset
+			ranged = true
 		default:
 			if option.Mandatory() {
 				fs.Logf(o, "Unsupported mandatory option: %v", option)
@@ -826,21 +832,62 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	}
 
 	headers := &http.Header{}
-	headers.Set("Range", fmt.Sprintf("bytes=%v-%v", offset, offset+count-1))
-	err = o.fs.pacer.Call(func() (bool, error) {
-		_, err = o.fs.fileClient.Download(
-			params,
-			files_sdk.WithContext(ctx),
-			files_sdk.RequestHeadersOption(headers),
-			files_sdk.ResponseBodyOption(func(closer io.ReadCloser) error {
-				in = closer
-				return err
-			}),
-		)
-		return shouldRetry(ctx, err)
+	if ranged {
+		headers.Set("Range", fmt.Sprintf("bytes=%v-%v", offset, offset+count-1))
+	}
+
+	key := linkcache.Key(o.fs.Name(), params.Path, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10), o.md5, o.crc32)
+	fetch := func(ctx context.Context) (*linkcache.Link, error) {
+		var file files_sdk.File
+		err := o.fs.pacer.Call(func() (bool, error) {
+			var err error
+			file, err = o.fs.fileClient.DownloadUri(params, files_sdk.WithContext(ctx))
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		link := &linkcache.Link{URL: file.DownloadUri, Value: file}
+		if u, err := downloadurl.New(file.DownloadUri); err == nil {
+			link.Expires = u.Time
+		}
+		return link, nil
+	}
+	return linkcache.Default.Open(ctx, key, linkLifetime, fetch, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		// With the file's DownloadUri set, the SDK downloads it
+		// without asking for another while it is valid
+		linkParams := params
+		linkParams.File = link.Value.(files_sdk.File)
+		var in io.ReadCloser
+		err := o.fs.pacer.Call(func() (bool, error) {
+			in = nil
+			_, err := o.fs.fileClient.Download(
+				linkParams,
+				files_sdk.WithContext(ctx),
+				files_sdk.RequestHeadersOption(headers),
+				files_sdk.ResponseOption(func(res *http.Response) error {
+					if err := files_sdk_lib.NonOkError(res); err != nil {
+						_ = res.Body.Close()
+						return err
+					}
+					in = res.Body
+					return nil
+				}),
+			)
+			return shouldRetry(ctx, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		return in, nil
 	})
-	return
 }
+
+// linkLifetime is how long a download link is used when it states no
+// expiry. Files.com's links state theirs in X-Files-Date and
+// X-Files-Expires, or in their storage's signature; this is a
+// conservative estimate for those that don't.
+const linkLifetime = 10 * time.Minute
 
 // Returns a pointer to t - useful for returning pointers to constants
 func ptr[T any](t T) *T {

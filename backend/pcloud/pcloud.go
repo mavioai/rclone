@@ -351,6 +351,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CaseInsensitive:         false,
 		CanHaveEmptyDirectories: true,
 		PartialUploads:          true,
+		FindByListing:           true,
+		// Estimates, not measurements
+		MaxFileStreams: 3,
+		MaxStreams:     8,
 	}).Fill(ctx, f)
 	if !canCleanup {
 		f.features.CleanUp = nil

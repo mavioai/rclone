@@ -43,7 +43,8 @@ type Error struct {
 		Lang  string `json:"lang"`
 		Value string `json:"value"`
 	} `json:"message"`
-	Reason string `json:"reason"`
+	Reason     string `json:"reason"`
+	StatusCode int    `json:"-"` // HTTP status of the response
 }
 
 // Satisfy error interface

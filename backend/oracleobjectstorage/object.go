@@ -57,6 +57,7 @@ type Object struct {
 	lastModified time.Time         // The modified time of the object if known
 	meta         map[string]string // The object metadata if known - may be nil
 	mimeType     string            // Content-Type of the object
+	etag         string            // ETag of the object if known
 
 	// Metadata as pointers to strings as they often won't be present
 	storageTier *string // e.g. Standard
@@ -109,6 +110,7 @@ func (o *Object) headObject(ctx context.Context) (info *objectstorage.HeadObject
 }
 
 func (o *Object) decodeMetaDataHead(info *objectstorage.HeadObjectResponse) (err error) {
+	o.etag = derefString(info.ETag)
 	return o.setMetaData(
 		info.ContentLength,
 		info.ContentMd5,
@@ -120,6 +122,7 @@ func (o *Object) decodeMetaDataHead(info *objectstorage.HeadObjectResponse) (err
 }
 
 func (o *Object) decodeMetaDataObject(info *objectstorage.GetObjectResponse) (err error) {
+	o.etag = derefString(info.ETag)
 	return o.setMetaData(
 		info.ContentLength,
 		info.ContentMd5,
@@ -192,6 +195,19 @@ func (o *Object) base64ToMd5(md5sumBase64 string) (md5 string, err error) {
 		return "", fmt.Errorf("failed to read md5sum from metadata %q: wrong length", md5sumBase64)
 	}
 	return hex.EncodeToString(md5sumBytes), nil
+}
+
+// VersionTag returns the ETag the object was found with, or ""
+func (o *Object) VersionTag() string {
+	return o.etag
+}
+
+// derefString returns *p, or "" if p is nil.
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // Fs returns the parent Fs
@@ -310,6 +326,9 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	}
 	o.meta[metaMtime] = swift.TimeToFloatString(modTime)
 	_, err = o.fs.Copy(ctx, o, o.remote)
+	if err == nil {
+		o.etag = "" // the copy has a new ETag
+	}
 	return err
 }
 
@@ -342,6 +361,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		ObjectName:    common.String(bucketPath),
 	}
 	o.applyGetObjectOptions(&req, options...)
+	if o.etag != "" {
+		// Read the version found, so that an object replaced since
+		// fails with 412 Precondition Failed instead of returning
+		// mixed content.
+		req.IfMatch = common.String(o.etag)
+	}
 	useBYOKGetObject(o.fs, &req)
 	var resp objectstorage.GetObjectResponse
 	err := o.fs.pacer.Call(func() (bool, error) {

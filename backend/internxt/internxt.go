@@ -4,11 +4,15 @@ package internxt
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +34,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
+	"github.com/rclone/rclone/lib/linkcache"
 	"github.com/rclone/rclone/lib/multipart"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
@@ -1064,11 +1069,20 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 // Open opens a file for streaming
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
-	rangeValue := ""
+	var offset, limit int64 = 0, -1
+	ranged := false
 	for _, option := range options {
-		switch option.(type) {
-		case *fs.RangeOption, *fs.SeekOption:
-			_, rangeValue = option.Header()
+		switch x := option.(type) {
+		case *fs.RangeOption:
+			offset, limit = x.Decode(o.size)
+			ranged = true
+		case *fs.SeekOption:
+			offset = x.Offset
+			ranged = true
+		default:
+			if option.Mandatory() {
+				fs.Logf(o, "Unsupported mandatory option: %v", option)
+			}
 		}
 	}
 
@@ -1076,16 +1090,138 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
-	var stream io.ReadCloser
+	// The shard's URL and key are kept, so that the opens of one object
+	// share them instead of each asking for the file's information
+	key := linkcache.Key(o.f.Name(), o.id, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10))
+	return linkcache.Default.Open(ctx, key, linkLifetime, o.shardLink, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.openShard(ctx, link, offset, limit, ranged)
+	})
+}
+
+// linkLifetime is how long the URL of a file's shard is kept when it
+// states no expiry: Internxt does not say how long they last, and a
+// refused one is requested again.
+const linkLifetime = 10 * time.Minute
+
+// shardKey is what decrypts the shard of a file, kept as the Value of
+// its link.
+type shardKey struct {
+	key, iv []byte
+	hash    string // RIPEMD-160(SHA-256) of the encrypted shard
+}
+
+// shardLink requests the file's information, its shard's URL and key.
+func (o *Object) shardLink(ctx context.Context) (*linkcache.Link, error) {
+	var info *buckets.BucketFileInfo
 	err := o.f.pacer.Call(func() (bool, error) {
 		var err error
-		stream, err = buckets.DownloadFileStream(ctx, o.f.cfg, o.id, rangeValue)
+		info, err = buckets.GetBucketFileInfo(ctx, o.f.cfg, o.f.cfg.Bucket, o.id)
 		return o.f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get bucket file info: %w", err)
+	}
+	if len(info.Shards) == 0 {
+		return nil, fmt.Errorf("no shards found for file %s", o.id)
+	}
+	shard := info.Shards[0]
+	key, iv, err := buckets.GenerateFileKey(o.f.cfg.Mnemonic, o.f.cfg.Bucket, info.Index)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate file key: %w", err)
+	}
+	return &linkcache.Link{URL: shard.URL, Value: &shardKey{key: key, iv: iv, hash: shard.Hash}}, nil
+}
+
+// openShard downloads and decrypts limit bytes (all if -1) from offset
+// of the shard of link. The hash of the shard is checked when it is
+// read whole to its end.
+func (o *Object) openShard(ctx context.Context, link *linkcache.Link, offset, limit int64, ranged bool) (io.ReadCloser, error) {
+	sk := link.Value.(*shardKey)
+	// AES-CTR decrypts from the start of a block
+	aligned := offset - offset%aes.BlockSize
+	var resp *http.Response
+	err := o.f.pacer.Call(func() (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", link.URL, nil)
+		if err != nil {
+			return false, err
+		}
+		if ranged {
+			if limit >= 0 {
+				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", aligned, offset+limit-1))
+			} else {
+				req.Header.Set("Range", fmt.Sprintf("bytes=%d-", aligned))
+			}
+		}
+		resp, err = o.f.cfg.HTTPClient.Do(req)
+		if err != nil {
+			return o.f.shouldRetry(ctx, fmt.Errorf("failed to execute download stream request: %w", err))
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			err = sdkerrors.NewHTTPError(resp, "shard download stream")
+			_ = resp.Body.Close()
+			if linkcache.Refused(err) {
+				// The shard's URL is refused: request another
+				// rather than authorizing again
+				return false, err
+			}
+			return o.f.shouldRetry(ctx, err)
+		}
+		return false, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return stream, nil
+	var encrypted io.Reader = resp.Body
+	var hasher hashSum
+	if !ranged && !o.f.cfg.SkipHashValidation {
+		hasher = sha256.New()
+		encrypted = io.TeeReader(resp.Body, hasher)
+	}
+	decrypted, err := buckets.DecryptReader(encrypted, sk.key, buckets.AddToIV(sk.iv, aligned/aes.BlockSize))
+	if err != nil {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("failed to create decrypt reader: %w", err)
+	}
+	if skip := offset - aligned; skip > 0 {
+		if _, err := io.CopyN(io.Discard, decrypted, skip); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("failed to discard offset bytes: %w", err)
+		}
+	}
+	return &shardReader{Reader: decrypted, body: resp.Body, hasher: hasher, want: sk.hash, id: o.id}, nil
+}
+
+// shardReader reads a decrypted shard and, when it has a hasher, checks
+// the hash of the shard at its end.
+type shardReader struct {
+	io.Reader
+	body   io.Closer
+	hasher hashSum // of the encrypted shard; nil to check nothing
+	want   string
+	id     string
+}
+
+// hashSum is the hash.Hash that computes the hash of a shard.
+type hashSum interface {
+	io.Writer
+	Sum(b []byte) []byte
+}
+
+// Read reads the shard, failing at its end if its hash is wrong.
+func (r *shardReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF && r.hasher != nil {
+		if got := buckets.ComputeFileHash(r.hasher.Sum(nil)); got != r.want {
+			return n, fmt.Errorf("hash mismatch for file %s: expected %s, got %s", r.id, r.want, got)
+		}
+		r.hasher = nil
+	}
+	return n, err
+}
+
+// Close closes the shard's body.
+func (r *shardReader) Close() error {
+	return r.body.Close()
 }
 
 // Update updates an existing file or creates a new one

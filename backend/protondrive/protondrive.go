@@ -590,6 +590,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		We can make assumption and implement the chunker, but for now, we would rather be safe about it, and let the block being concurrently downloaded and decrypted in the background, to speed up the download operation!
 		*/
 		NoMultiThreading: true,
+		FindByListing:    true,
+		// Estimates, not measurements
+		MaxFileStreams: 2,
+		MaxStreams:     6,
 	}).Fill(ctx, f)
 
 	protonDrive, err := newProtonDrive(ctx, f, opt, m)

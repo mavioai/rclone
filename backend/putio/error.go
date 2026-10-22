@@ -28,6 +28,12 @@ func (e *statusCodeError) Error() string {
 	return fmt.Sprintf("unexpected status code (%d) response while doing %s to %s", e.response.StatusCode, e.response.Request.Method, e.response.Request.URL.String())
 }
 
+// HTTPStatusCode returns the status of the response, so that a refused
+// download link is recognised.
+func (e *statusCodeError) HTTPStatusCode() int {
+	return e.response.StatusCode
+}
+
 // This method is called from fserrors.ShouldRetry() to determine if an error should be retried.
 // Some errors (e.g. 429 Too Many Requests) are handled before this step, so they are not included here.
 func (e *statusCodeError) Temporary() bool {

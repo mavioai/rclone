@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	smb2 "github.com/cloudsoda/go-smb2"
+
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -403,6 +405,53 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (_ fs.Objec
 	err = cn.smbShare.Rename(f.toSambaPath(srcPath), f.toSambaPath(dstPath))
 	f.putConnection(&cn, err)
 	if err != nil {
+		return nil, translateError(err, false)
+	}
+	return f.findObjectSeparate(ctx, dstShare, dstPath)
+}
+
+// The NT statuses with which servers refuse to hard link a file: where
+// their file system has none, or across volumes.
+var cantLinkStatuses = map[uint32]bool{
+	0xC0000003: true, // STATUS_INVALID_INFO_CLASS
+	0xC0000010: true, // STATUS_INVALID_DEVICE_REQUEST
+	0xC00000BB: true, // STATUS_NOT_SUPPORTED
+	0xC00000D4: true, // STATUS_NOT_SAME_DEVICE
+}
+
+// Link hard links src to remote on the same share.
+//
+// If it isn't possible then return fs.ErrorCantLink
+func (f *Fs) Link(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	dstShare, dstPath := f.split(remote)
+	srcObj, ok := src.(*Object)
+	if !ok {
+		fs.Debugf(src, "Can't hard link - not same remote type")
+		return nil, fs.ErrorCantLink
+	}
+	srcShare, srcPath := srcObj.split()
+	if dstShare != srcShare {
+		fs.Debugf(src, "Can't hard link - must be on the same share")
+		return nil, fs.ErrorCantLink
+	}
+
+	err := f.ensureDirectory(ctx, dstShare, dstPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make parent directories: %w", err)
+	}
+
+	cn, err := f.getConnection(ctx, dstShare)
+	if err != nil {
+		return nil, err
+	}
+	err = cn.smbShare.Link(f.toSambaPath(srcPath), f.toSambaPath(dstPath))
+	f.putConnection(&cn, err)
+	if err != nil {
+		var rerr *smb2.ResponseError
+		if errors.As(err, &rerr) && cantLinkStatuses[rerr.Code] {
+			fs.Debugf(src, "Can't hard link: %v", err)
+			return nil, fs.ErrorCantLink
+		}
 		return nil, translateError(err, false)
 	}
 	return f.findObjectSeparate(ctx, dstShare, dstPath)
@@ -968,6 +1017,7 @@ var (
 	_ fs.Fs          = &Fs{}
 	_ fs.PutStreamer = &Fs{}
 	_ fs.Mover       = &Fs{}
+	_ fs.Linker      = &Fs{}
 	_ fs.DirMover    = &Fs{}
 	_ fs.Abouter     = &Fs{}
 	_ fs.Shutdowner  = &Fs{}

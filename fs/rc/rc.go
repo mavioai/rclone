@@ -39,6 +39,31 @@ var OptionsInfo = fs.Options{{
 	Help:    "Don't read the modification time (can speed things up)",
 	Groups:  "RC",
 }, {
+	Name:    "rc_serve_cache_duration",
+	Default: fs.Duration(5 * time.Minute),
+	Help:    "How long to keep the objects found when serving remote objects (0 to disable)",
+	Groups:  "RC",
+}, {
+	Name:    "rc_serve_cache_size",
+	Default: 10000,
+	Help:    "Maximum number of objects to keep when serving remote objects",
+	Groups:  "RC",
+}, {
+	Name:    "rc_serve_poll_interval",
+	Default: fs.Duration(time.Minute),
+	Help:    "Time to wait between polling for changes of the objects kept when serving remote objects (0 to disable)",
+	Groups:  "RC",
+}, {
+	Name:    "rc_serve_max_file_streams",
+	Default: 0,
+	Help:    "Maximum streams of one file open when serving remote objects (0 for the backend's default, -1 for no limit)",
+	Groups:  "RC",
+}, {
+	Name:    "rc_serve_max_streams",
+	Default: 0,
+	Help:    "Maximum streams of one account open when serving remote objects (0 for the backend's default, -1 for no limit)",
+	Groups:  "RC",
+}, {
 	Name:    "rc_no_auth",
 	Default: false,
 	Help:    "Don't require auth for certain methods",
@@ -106,6 +131,11 @@ type Options struct {
 	Files               string                 `config:"rc_files"`                   // set to enable serving files locally
 	Serve               bool                   `config:"rc_serve"`                   // set to serve files from remotes
 	ServeNoModTime      bool                   `config:"rc_serve_no_modtime"`        // don't read the modification time
+	ServeCacheDuration  fs.Duration            `config:"rc_serve_cache_duration"`    // how long to keep the objects found
+	ServeCacheSize      int                    `config:"rc_serve_cache_size"`        // maximum number of objects kept
+	ServePollInterval   fs.Duration            `config:"rc_serve_poll_interval"`     // interval of polling for changes of the objects kept
+	ServeMaxFileStreams int                    `config:"rc_serve_max_file_streams"`  // maximum streams of a file, 0 for the backend's default, -1 for no limit
+	ServeMaxStreams     int                    `config:"rc_serve_max_streams"`       // maximum streams of an account, 0 for the backend's default, -1 for no limit
 	NoAuth              bool                   `config:"rc_no_auth"`                 // set to disable auth checks on methods which require it
 	WebUI               bool                   `config:"rc_web_gui"`                 // set to launch the web ui
 	WebGUIUpdate        bool                   `config:"rc_web_gui_update"`          // set to check new update

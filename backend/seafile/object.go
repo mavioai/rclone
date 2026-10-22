@@ -3,10 +3,12 @@ package seafile
 import (
 	"context"
 	"io"
+	"strconv"
 	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/linkcache"
 )
 
 // Object describes a seafile object (also commonly called a file)
@@ -71,16 +73,22 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 
 // Open opens the file for read.  Call Close() on the returned io.ReadCloser
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	downloadLink, err := o.fs.getDownloadLink(ctx, o.libraryID, o.pathInLibrary)
-	if err != nil {
-		return nil, err
+	key := linkcache.Key(o.fs.Name(), o.libraryID, o.pathInLibrary, strconv.FormatInt(o.size, 10), strconv.FormatInt(o.modTime.UnixNano(), 10))
+	fetch := func(ctx context.Context) (*linkcache.Link, error) {
+		downloadLink, err := o.fs.getDownloadLink(ctx, o.libraryID, o.pathInLibrary)
+		if err != nil {
+			return nil, err
+		}
+		return &linkcache.Link{URL: downloadLink}, nil
 	}
-	reader, err := o.fs.download(ctx, downloadLink, o.Size(), options...)
-	if err != nil {
-		return nil, err
-	}
-	return reader, nil
+	return linkcache.Default.Open(ctx, key, linkLifetime, fetch, func(ctx context.Context, link *linkcache.Link) (io.ReadCloser, error) {
+		return o.fs.download(ctx, link.URL, o.Size(), options...)
+	})
 }
+
+// linkLifetime is how long a download link is used: Seafile's reusable
+// download links (reuse=1) last an hour.
+const linkLifetime = time.Hour
 
 // Update in to the object with the modTime given of the given size
 //

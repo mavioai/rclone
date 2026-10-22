@@ -3,8 +3,10 @@ package s3
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
 	"github.com/rclone/rclone/lib/bucket"
+	"github.com/rclone/rclone/lib/http/serve"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -293,6 +296,85 @@ func TestObjectNotFoundMapping(t *testing.T) {
 	assert.ErrorIs(t, getErr, fs.ErrorObjectNotFound)
 
 	assert.Equal(t, headErr, getErr, "HeadObject and GetObject should map a 404 to the same error")
+}
+
+func TestOpenIfMatch(t *testing.T) {
+	ctx, opt, client := SetupS3Test(t)
+	var mu sync.Mutex
+	etag, gotIfMatch := `"0123456789abcdef0123456789abcdef-2"`, ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Last-Modified", time.Unix(1000, 0).UTC().Format(http.TimeFormat))
+		w.Header().Set("Content-Length", "5")
+		switch r.Method {
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			gotIfMatch = r.Header.Get("If-Match")
+			if gotIfMatch != "" && gotIfMatch != etag {
+				w.Header().Del("Content-Length")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				_, _ = io.WriteString(w, `<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>`)
+				return
+			}
+			_, _ = io.WriteString(w, "hello")
+		}
+	}))
+	defer server.Close()
+
+	opt.Endpoint = server.URL
+	opt.ForcePathStyle = true
+	opt.Region = "us-east-1"
+	opt.AccessKeyID = "id"
+	opt.SecretAccessKey = "secret"
+	c, _, err := s3Connection(ctx, opt, client)
+	require.NoError(t, err)
+	f := &Fs{
+		name:  "s3test",
+		opt:   *opt,
+		ctx:   ctx,
+		c:     c,
+		pacer: fs.NewPacer(ctx, pacer.NewS3(pacer.MinSleep(minSleep))),
+		cache: bucket.NewCache(),
+	}
+	f.setRoot("bucket")
+
+	open := func(o fs.Object) error {
+		in, err := o.Open(ctx)
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(io.Discard, in)
+		return in.Close()
+	}
+	o, err := f.NewObject(ctx, "file")
+	require.NoError(t, err)
+	require.NoError(t, open(o))
+	assert.Equal(t, `"0123456789abcdef0123456789abcdef-2"`, gotIfMatch, "reads the multipart ETag found by HEAD")
+
+	mu.Lock()
+	etag = `"fedcba9876543210fedcba9876543210"`
+	mu.Unlock()
+	err = open(o)
+	require.Error(t, err)
+	status, _ := serve.ErrorStatus(err)
+	assert.Equal(t, http.StatusPreconditionFailed, status, "a replaced object fails with 412")
+
+	// An object without an ETag reads unconditionally
+	require.NoError(t, open(&Object{fs: f, remote: "file"}))
+	assert.Equal(t, "", gotIfMatch)
+
+	// --s3-no-read-if-match turns the condition off
+	f.opt.NoReadIfMatch = true
+	o, err = f.NewObject(ctx, "file")
+	require.NoError(t, err)
+	mu.Lock()
+	etag = `"v3"`
+	mu.Unlock()
+	require.NoError(t, open(o))
+	assert.Equal(t, "", gotIfMatch)
 }
 
 // TestIntegration runs integration tests against the remote

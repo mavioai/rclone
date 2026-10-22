@@ -525,6 +525,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *objects
 			fs.Debugf(o, "Failed to find object length")
 		}
 		o.storageTier = storageTierMap[strings.ToLower(string(info.StorageTier))]
+		o.etag = derefString(info.Etag)
 	} else {
 		err := o.readMetaData(ctx) // reads info and headers, returning an error
 		if err != nil {
@@ -809,8 +810,9 @@ var (
 	_ fs.CleanUpper      = &Fs{}
 	_ fs.OpenChunkWriter = &Fs{}
 
-	_ fs.Object    = &Object{}
-	_ fs.MimeTyper = &Object{}
-	_ fs.GetTierer = &Object{}
-	_ fs.SetTierer = &Object{}
+	_ fs.Object        = &Object{}
+	_ fs.MimeTyper     = &Object{}
+	_ fs.VersionTagger = &Object{}
+	_ fs.GetTierer     = &Object{}
+	_ fs.SetTierer     = &Object{}
 )

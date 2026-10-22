@@ -270,6 +270,8 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 		DirModTimeUpdatesOnWrite: true,
 		PartialUploads:           true,
 	}).Fill(ctx, f).Mask(ctx, wrappedFs).WrapsFs(f, wrappedFs)
+	// A lookup reads the metadata object, which a listing doesn't give
+	f.features.FindByListing = false
 	// We support reading MIME types no matter the wrapped fs
 	f.features.ReadMimeType = true
 	// We can only support putstream if we have serverside copy or move

@@ -234,6 +234,36 @@ func (f *Fs) deleteTask(ctx context.Context, ID string, deleteFiles bool) (err e
 	return
 }
 
+// listTasks gets offline task list from server
+func (f *Fs) listTasks(ctx context.Context) (tasks []*api.Task, err error) {
+	params := url.Values{}
+	params.Set("type", "offline")
+	params.Set("limit", "100")
+	opts := rest.Opts{
+		Method:     "GET",
+		Path:       "/drive/v1/tasks",
+		Parameters: params,
+	}
+	pageToken := ""
+	for {
+		params.Set("page_token", pageToken)
+		var taskList api.TaskList
+		var resp *http.Response
+		err = f.pacer.Call(func() (bool, error) {
+			resp, err = f.rst.CallJSON(ctx, &opts, nil, &taskList)
+			return f.shouldRetry(ctx, resp, err)
+		})
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, taskList.Tasks...)
+		if taskList.NextPageToken == "" || len(taskList.Tasks) == 0 {
+			return tasks, nil
+		}
+		pageToken = taskList.NextPageToken
+	}
+}
+
 // getAbout gets drive#quota information from server
 func (f *Fs) getAbout(ctx context.Context) (info *api.About, err error) {
 	opts := rest.Opts{

@@ -1,0 +1,4 @@
+[submodule "third_party/go-smb2"]
+	path = third_party/go-smb2
+	url = https://github.com/mavioai/go-smb2
+	branch = mavio

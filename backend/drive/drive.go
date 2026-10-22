@@ -1412,6 +1412,8 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.features = (&fs.Features{
+		MaxFileStreams:           4, // estimated streams the storage serves well
+		MaxStreams:               16,
 		DuplicateFiles:           true,
 		ReadMimeType:             true,
 		WriteMimeType:            true,

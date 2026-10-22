@@ -74,6 +74,7 @@ type Prop struct {
 	IsCollection *string   `xml:"DAV: prop>iscollection,omitempty"` // this is a Microsoft extension see #2716
 	Size         int64     `xml:"DAV: prop>getcontentlength,omitempty"`
 	Modified     Time      `xml:"DAV: prop>getlastmodified,omitempty"`
+	ETag         string    `xml:"DAV: prop>getetag,omitempty"`
 	Checksums    []string  `xml:"prop>checksums>checksum,omitempty"`
 	Permissions  string    `xml:"prop>permissions,omitempty"`
 	MESha1Hex    *string   `xml:"ME: prop>sha1hex,omitempty"` // Fastmail-specific sha1 checksum

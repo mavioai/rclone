@@ -608,6 +608,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.sharing = sharing.NewContext(cfg)
 	f.users = users.NewContext(cfg)
 	f.features = (&fs.Features{
+		MaxFileStreams:          4, // estimated streams the storage serves well
+		MaxStreams:              16,
 		CaseInsensitive:         true,
 		ReadMimeType:            false,
 		CanHaveEmptyDirectories: true,

@@ -438,6 +438,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		authExpiry: parseExpiry(opt.AuthorizationExpiry),
 	}
 	f.features = (&fs.Features{
+		FindByListing:           true, // NewObject lists the parent folder
 		CaseInsensitive:         true,
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)

@@ -513,6 +513,17 @@ very small even with this flag.
 			Default:  false,
 			Advanced: true,
 		}, {
+			Name: "no_read_if_match",
+			Help: `If set, don't make reads conditional on the object's ETag.
+
+Normally rclone reads an object with If-Match set to the ETag it found
+the object with, so that an object replaced since fails the read with
+a precondition error instead of returning the new content under the
+old size and hash. Set this for providers that answer such reads
+wrongly.`,
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -1118,6 +1129,7 @@ type Options struct {
 	NoCheckBucket               bool                 `config:"no_check_bucket"`
 	NoHead                      bool                 `config:"no_head"`
 	NoHeadObject                bool                 `config:"no_head_object"`
+	NoReadIfMatch               bool                 `config:"no_read_if_match"`
 	Enc                         encoder.MultiEncoder `config:"encoding"`
 	DisableHTTP2                bool                 `config:"disable_http2"`
 	DownloadURL                 string               `config:"download_url"`
@@ -1182,6 +1194,7 @@ type Object struct {
 	fs           *Fs               // what this object is part of
 	remote       string            // The remote path
 	md5          string            // md5sum of the object
+	etag         string            // ETag of the object as the server sent it, "" if unknown
 	bytes        int64             // size of the object
 	lastModified time.Time         // Last modified
 	meta         map[string]string // The object metadata if known - may be nil - with lower case keys
@@ -2065,6 +2078,7 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *types.O
 			o.lastModified = *info.LastModified
 		}
 		o.setMD5FromEtag(deref(info.ETag))
+		o.etag = strings.Clone(deref(info.ETag))
 		o.bytes = deref(info.Size)
 		o.storageClass = stringClone(string(info.StorageClass))
 		o.versionID = stringClonePointer(versionID)
@@ -4065,6 +4079,11 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	return o.md5, nil
 }
 
+// VersionTag returns the ETag the object was found with, or ""
+func (o *Object) VersionTag() string {
+	return o.etag
+}
+
 // Size returns the size of an object in bytes
 func (o *Object) Size() int64 {
 	return o.bytes
@@ -4148,6 +4167,7 @@ func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
 		o.bytes = *resp.ContentLength
 	}
 	o.setMD5FromEtag(deref(resp.ETag))
+	o.etag = strings.Clone(deref(resp.ETag))
 	o.meta = s3MetadataToMap(resp.Metadata)
 	// Read MD5 from metadata if present
 	if md5sumBase64, ok := o.meta[metaMD5Hash]; ok {
@@ -4257,7 +4277,11 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	if o.fs.opt.RequesterPays {
 		req.RequestPayer = types.RequestPayerRequester
 	}
-	return o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
+	err = o.fs.copy(ctx, &req, bucket, bucketPath, bucket, bucketPath, o)
+	if err == nil {
+		o.etag = "" // the copy may have a new ETag
+	}
+	return err
 }
 
 // Storable raturns a boolean indicating if this object is storable
@@ -4385,6 +4409,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		Bucket:    &bucket,
 		Key:       &bucketPath,
 		VersionId: o.versionID,
+	}
+	// Read the version the object was found with, unless a version ID
+	// pins it already, so that an object replaced since fails with 412
+	// Precondition Failed instead of returning mixed content.
+	if o.versionID == nil && o.etag != "" && !o.fs.opt.NoReadIfMatch && !o.fs.opt.DirectoryBucket {
+		req.IfMatch = aws.String(o.etag)
 	}
 	if o.fs.opt.RequesterPays {
 		req.RequestPayer = types.RequestPayerRequester
@@ -5173,6 +5203,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 	o.setMetaData(head)
+	if o.fs.opt.NoHead && size >= 0 && gotETag == "" {
+		o.etag = "" // made up from the MD5, so don't read with it
+	}
 
 	// Check multipart upload ETag if required
 	if o.fs.opt.UseMultipartEtag.Value && !o.fs.etagIsNotMD5 && wantETag != "" && head.ETag != nil && *head.ETag != "" {
@@ -5355,6 +5388,7 @@ func (o *Object) SetTier(tier string) (err error) {
 		return err
 	}
 	o.storageClass = &tier
+	o.etag = "" // the copy may have a new ETag
 	return err
 }
 
@@ -5436,6 +5470,7 @@ var (
 	_ fs.OpenChunkWriter = &Fs{}
 	_ fs.Object          = &Object{}
 	_ fs.MimeTyper       = &Object{}
+	_ fs.VersionTagger   = &Object{}
 	_ fs.GetTierer       = &Object{}
 	_ fs.SetTierer       = &Object{}
 	_ fs.Metadataer      = &Object{}

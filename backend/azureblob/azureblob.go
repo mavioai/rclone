@@ -481,6 +481,7 @@ type Object struct {
 	meta            map[string]string // blob metadata - take metadataMu when accessing
 	tags            map[string]string // blob tags
 	contentEncoding *string           // Content-Encoding of the object
+	etag            azcore.ETag       // ETag of the object if known
 }
 
 // ------------------------------------------------------------
@@ -2258,6 +2259,7 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 	}
 	o.setMetadata(metadata)
 	o.contentEncoding = info.ContentEncoding
+	o.setETag(info.ETag)
 
 	// If decompressing then size and md5sum are unknown
 	if o.fs.opt.Decompress && o.contentEncoding != nil && *o.contentEncoding == "gzip" {
@@ -2266,6 +2268,26 @@ func (o *Object) decodeMetaDataFromPropertiesResponse(info *blob.GetPropertiesRe
 	}
 
 	return nil
+}
+
+// VersionTag returns the ETag the object was found with, or ""
+func (o *Object) VersionTag() string {
+	return string(o.etag)
+}
+
+// setETag records the ETag of the object, if known.
+//
+// Listings give the ETag without the quotes that the headers have, so
+// add them.
+func (o *Object) setETag(etag *azcore.ETag) {
+	switch {
+	case etag == nil || *etag == "" || strings.HasPrefix(string(*etag), "W/"):
+		o.etag = ""
+	case strings.HasPrefix(string(*etag), `"`):
+		o.etag = *etag
+	default:
+		o.etag = azcore.ETag(`"` + string(*etag) + `"`)
+	}
 }
 
 func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamResponse) (err error) {
@@ -2320,6 +2342,7 @@ func (o *Object) decodeMetaDataFromDownloadResponse(info *blob.DownloadStreamRes
 	// }
 	o.setMetadata(metadata)
 	o.contentEncoding = info.ContentEncoding
+	o.setETag(info.ETag)
 
 	// If decompressing then size and md5sum are unknown
 	if o.fs.opt.Decompress && o.contentEncoding != nil && *o.contentEncoding == "gzip" {
@@ -2365,6 +2388,7 @@ func (o *Object) decodeMetaDataFromBlob(info *container.BlobItem) (err error) {
 	}
 	o.setMetadata(metadata)
 	o.contentEncoding = info.Properties.ContentEncoding
+	o.setETag(info.Properties.ETag)
 
 	// If decompressing then size and md5sum are unknown
 	if o.fs.opt.Decompress && o.contentEncoding != nil && *o.contentEncoding == "gzip" {
@@ -2398,6 +2422,7 @@ func (o *Object) getBlockBlobSVC() *blockblob.Client {
 // clearMetaData clears enough metadata so readMetaData will re-read it
 func (o *Object) clearMetaData() {
 	o.modTime = time.Time{}
+	o.etag = ""
 }
 
 // readMetaData gets the metadata if it hasn't already been fetched
@@ -2477,14 +2502,17 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 
 	blb := o.getBlobSVC()
 	opt := blob.SetMetadataOptions{}
+	var resp blob.SetMetadataResponse
 	err := o.fs.pacer.Call(func() (bool, error) {
-		_, err := blb.SetMetadata(ctx, o.getMetadata(), &opt)
+		var err error
+		resp, err = blb.SetMetadata(ctx, o.getMetadata(), &opt)
 		return o.fs.shouldRetry(ctx, err)
 	})
 	if err != nil {
 		return err
 	}
 	o.modTime = modTime
+	o.setETag(resp.ETag) // setting the metadata changes the ETag
 	return nil
 }
 
@@ -2533,6 +2561,15 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		// AccessConditions *AccessConditions
 		// CpkInfo          *CpkInfo
 		// CpkScopeInfo     *CpkScopeInfo
+	}
+	if o.etag != "" {
+		// Read the version found, so that a blob replaced since
+		// fails with 412 Precondition Failed instead of returning
+		// mixed content.
+		etag := o.etag
+		opt.AccessConditions = &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfMatch: &etag},
+		}
 	}
 	var downloadResponse blob.DownloadStreamResponse
 	err = o.fs.pacer.Call(func() (bool, error) {
@@ -3287,6 +3324,7 @@ var (
 	_ fs.OpenChunkWriter = &Fs{}
 	_ fs.Object          = &Object{}
 	_ fs.MimeTyper       = &Object{}
+	_ fs.VersionTagger   = &Object{}
 	_ fs.GetTierer       = &Object{}
 	_ fs.SetTierer       = &Object{}
 )
